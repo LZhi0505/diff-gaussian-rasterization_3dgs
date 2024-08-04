@@ -24,6 +24,12 @@
 #include <string>
 #include <functional>
 
+/**
+ * rasterize_points.cu及.h文件定义了 RasterizeGaussiansCUDA、RasterizeGaussiansBackwardCUDA、markVisible 三个C函数，进行一些变量的初始化
+ * RasterizeGaussiansCUDA、RasterizeGaussiansBackwardCUDA 分别使用CudaRasterizer::Rasterizer类的 forward、backward函数。
+ * Rasterizer类在cuda_rasterizer文件夹下的 rasterizer.h、rasterizer_impl.h、rasterizer_impl.cu中定义
+ */
+
 std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     auto lambda = [&t](size_t N) {
         t.resize_({(long long)N});

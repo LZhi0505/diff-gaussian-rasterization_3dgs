@@ -29,6 +29,20 @@ def rasterize_gaussians(
     cov3Ds_precomp,
     raster_settings,
 ):
+    """
+    调用_RasterizeGaussians，其继承自torch.autograd.Function，需自己写forward和backward
+    :param means3D:
+    :param means2D:
+    :param sh:
+    :param colors_precomp:
+    :param opacities:
+    :param scales:
+    :param rotations:
+    :param cov3Ds_precomp:
+    :param raster_settings:
+    :return:
+    """
+    #
     return _RasterizeGaussians.apply(
         means3D,
         means2D,
@@ -42,7 +56,17 @@ def rasterize_gaussians(
     )
 
 class _RasterizeGaussians(torch.autograd.Function):
+    """
+    继承自torch.autograd.Function，需chong写forward和backward。
+    backward函数 和 forward函数输入输出需要相对应：
+        forward输出了color, radii，则 backward输入ctx, grad_out_color, 也就是上下文信息和两个forward输出的变量的grad；
+        forward输入了除ctx外9个变量，则 backward返回9个梯度，不需要梯度的变量用None占位
+
+    forward 和 backward中调用了_C.rasterize_gaussians 和 _C.rasterize_gaussians_backward，这是C函数，其桥梁在文件./submodules/diff-gaussian-rasterization/ext.cpp中定义；
+    即
+    """
     @staticmethod
+    # 自定义操作实际执行计算的地方。这个方法接收输入参数，并返回操作的输出。在这个方法中，你可以使用任何PyTorch操作或其他Python代码
     def forward(
         ctx,
         means3D,
@@ -98,6 +122,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         return color, radii
 
     @staticmethod
+    # 定义了如何计算你的操作相对于其输入的梯度。这里，你需要根据前向传播的结果和外部梯度计算输入张量的梯度。
     def backward(ctx, grad_out_color, _):
 
         # Restore necessary values from context
@@ -154,6 +179,7 @@ class _RasterizeGaussians(torch.autograd.Function):
 
         return grads
 
+# 定义初始化类GaussianRasterizer的参数
 class GaussianRasterizationSettings(NamedTuple):
     image_height: int
     image_width: int 
@@ -168,6 +194,7 @@ class GaussianRasterizationSettings(NamedTuple):
     prefiltered : bool
     debug : bool
 
+# GaussianRasterizer类
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):
         super().__init__()
@@ -207,6 +234,7 @@ class GaussianRasterizer(nn.Module):
             cov3D_precomp = torch.Tensor([])
 
         # Invoke C++/CUDA rasterization routine
+        # 调用rasterize_gaussians，其调用_RasterizeGaussians
         return rasterize_gaussians(
             means3D,
             means2D,

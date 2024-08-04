@@ -30,6 +30,12 @@ namespace cg = cooperative_groups;
 #include "forward.h"
 #include "backward.h"
 
+
+/**
+ * 高斯排序和合成顺序（rasterizer_impl.cu）
+ * 计算每个高斯的前后顺序（Alpha合成）：当多个高斯分布重叠在同一区域时，需要确定它们在图像上的渲染顺序，这通常基于它们距离摄像机的远近来决定。
+ */
+
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
 uint32_t getHigherMsb(uint32_t n)
@@ -195,6 +201,36 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
 
 // Forward rendering procedure for differentiable rasterization
 // of Gaussians.
+/**
+ * 高斯可微光栅化的前向渲染处理，该函数可当作 main 函数
+ * @param geometryBuffer
+ * @param binningBuffer
+ * @param imageBuffer
+ * @param P
+ * @param D
+ * @param M
+ * @param background
+ * @param width
+ * @param height
+ * @param means3D
+ * @param shs
+ * @param colors_precomp
+ * @param opacities
+ * @param scales
+ * @param scale_modifier
+ * @param rotations
+ * @param cov3D_precomp
+ * @param viewmatrix
+ * @param projmatrix
+ * @param cam_pos
+ * @param tan_fovx
+ * @param tan_fovy
+ * @param prefiltered
+ * @param out_color
+ * @param radii
+ * @param debug
+ * @return
+ */
 int CudaRasterizer::Rasterizer::forward(
 	std::function<char* (size_t)> geometryBuffer,
 	std::function<char* (size_t)> binningBuffer,
@@ -272,6 +308,7 @@ int CudaRasterizer::Rasterizer::forward(
 		prefiltered
 	), debug)
 
+    // ---开始--- 通过视图变换 W 计算出像素与所有重叠高斯的距离，即这些高斯的深度，形成一个有序的高斯列表
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
 	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
@@ -286,7 +323,7 @@ int CudaRasterizer::Rasterizer::forward(
 
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
 	// and corresponding dublicated Gaussian indices to be sorted
-	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
+	duplicateWithKeys << <(P + 255) / 256, 256 >> > (   // 根据 tile，复制 Gaussian
 		P,
 		geomState.means2D,
 		geomState.depths,
@@ -300,7 +337,7 @@ int CudaRasterizer::Rasterizer::forward(
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
 
 	// Sort complete list of (duplicated) Gaussian indices by keys
-	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+	CHECK_CUDA(cub::DeviceRadixSort::SortPairs( // 对复制后的所有 Gaussians 进行排序，排序的结果可供平行化渲染使用
 		binningState.list_sorting_space,
 		binningState.sorting_size,
 		binningState.point_list_keys_unsorted, binningState.point_list_keys,
@@ -311,14 +348,17 @@ int CudaRasterizer::Rasterizer::forward(
 
 	// Identify start and end of per-tile workloads in sorted list
 	if (num_rendered > 0)
-		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
+		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (   // 根据有序的Gaussian列表，判断每个 tile 需要跟哪一个 range 内的 Gaussians 进行计算
 			num_rendered,
 			binningState.point_list_keys,
 			imgState.ranges);
 	CHECK_CUDA(, debug)
+    // ---结束--- 通过视图变换 W 计算出像素与所有重叠高斯的距离，即这些高斯的深度，形成一个有序的高斯列表
 
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+
+    //! 核心渲染函数，定义在forward.h中，具体实现在 forward.cu/renderCUDA
 	CHECK_CUDA(FORWARD::render(
 		tile_grid, block,
 		imgState.ranges,
@@ -387,6 +427,7 @@ void CudaRasterizer::Rasterizer::backward(
 	// opacity and RGB of Gaussians from per-pixel loss gradients.
 	// If we were given precomputed colors and not SHs, use them.
 	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
+    //! 核心渲染函数，定义在backward.h中，具体实现在 backward.cu/renderCUDA
 	CHECK_CUDA(BACKWARD::render(
 		tile_grid,
 		block,

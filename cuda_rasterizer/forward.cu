@@ -15,20 +15,34 @@
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
+// 核函数使用__global__修饰符声明。这表明这个函数是一个核函数，它可以在GPU上执行，而不是在CPU上执行
+// 当调用一个核函数时，需要使用特殊的语法<<<grid, block>>>来指定执行配置。这个配置包括两个部分：
+// Grid：是指定了多少个块（block）组成的网格（grid）。整个网格代表了所有的并行执行单元的集合。
+// Block：是指每个块中包含多少个线程。块内的线程可以共享数据并协作执行任务。
+
 // Forward method for converting the input spherical harmonics
 // coefficients of each Gaussian to a simple RGB color.
+/**
+ * 计算3D高斯的颜色
+ * @param idx
+ * @param deg 球屑函数的阶数
+ * @param max_coeffs
+ * @param means 所有高斯的中心位置
+ * @param campos 相机中心位置
+ * @param shs 球谐系数 (16, 3)
+ * @param clamped
+ * @return
+ */
 __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, bool* clamped)
 {
-	// The implementation is loosely based on code for 
-	// "Differentiable Point-Based Radiance Fields for 
-	// Efficient View Synthesis" by Zhang et al. (2022)
-	glm::vec3 pos = means[idx];
-	glm::vec3 dir = pos - campos;
+	// 该函数基于zhang等人的论文"Differentiable Point-Based Radiance Fields for Efficient View Synthesis"中的代码实现
+	glm::vec3 pos = means[idx];		// 当前高斯的中心位置
+	glm::vec3 dir = pos - campos;	// 从相机中心指向当前高斯的 方向
 	dir = dir / glm::length(dir);
 
 	glm::vec3* sh = ((glm::vec3*)shs) + idx * max_coeffs;
 	glm::vec3 result = SH_C0 * sh[0];
-
+	// SH_C1等是球谐函数的基函数，sh是球谐系数(16, 3)
 	if (deg > 0)
 	{
 		float x = dir.x;
@@ -71,12 +85,27 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 }
 
 // Forward version of 2D covariance matrix computation
+/**
+ * 3DGS协方差矩阵 -> 2D的变换:
+ * 1. 世界坐标系到相机坐标：viewmatirx
+ * 2. 视锥到立方体：雅克比矩阵
+ * @param mean      3DGS的世界坐标系下的中心位置
+ * @param focal_x   相机的焦距，物体离相机的远近等比例缩小
+ * @param focal_y
+ * @param tan_fovx
+ * @param tan_fovy
+ * @param cov3D     世界坐标系下3G高斯的协方差矩阵
+ * @param viewmatrix 世界坐标系到相机坐标系的变换矩阵
+ * @return
+ */
 __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y, float tan_fovx, float tan_fovy, const float* cov3D, const float* viewmatrix)
 {
 	// The following models the steps outlined by equations 29
 	// and 31 in "EWA Splatting" (Zwicker et al., 2002). 
 	// Additionally considers aspect / scaling of viewport.
 	// Transposes used to account for row-/column-major conventions.
+	// 雅克比矩阵在一个点附近才满足使用线性变换 近似 非线性变换的条件，而高斯的中心位置就是这个点，所以先求得3D高斯在相机坐标系下的位置）
+	// 计算t在视锥中的位置
 	float3 t = transformPoint4x3(mean, viewmatrix);
 
 	const float limx = 1.3f * tan_fovx;
@@ -86,23 +115,28 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 	t.x = min(limx, max(-limx, txtz)) * t.z;
 	t.y = min(limy, max(-limy, tytz)) * t.z;
 
+	// 构建雅克比矩阵（透视变换 = 视椎体压成立方体 + 视口变换）
 	glm::mat3 J = glm::mat3(
 		focal_x / t.z, 0.0f, -(focal_x * t.x) / (t.z * t.z),
 		0.0f, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
 		0, 0, 0);
 
+	// W：世界到相机的旋转矩阵 的 转置
 	glm::mat3 W = glm::mat3(
 		viewmatrix[0], viewmatrix[4], viewmatrix[8],
 		viewmatrix[1], viewmatrix[5], viewmatrix[9],
 		viewmatrix[2], viewmatrix[6], viewmatrix[10]);
 
-	glm::mat3 T = W * J;
+	glm::mat3 T = W * J;	// 协方差矩阵从3D变为2D的公式中右边的部分
 
 	glm::mat3 Vrk = glm::mat3(
 		cov3D[0], cov3D[1], cov3D[2],
 		cov3D[1], cov3D[3], cov3D[4],
 		cov3D[2], cov3D[4], cov3D[5]);
 
+	// 2D协方差矩阵
+	// [sigma_x sigma_xy]
+	// [sigma_xy sigma_y]
 	glm::mat3 cov = glm::transpose(T) * glm::transpose(Vrk) * T;
 
 	// Apply low-pass filter: every Gaussian should be at least
@@ -152,6 +186,9 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 }
 
 // Perform initial steps for each Gaussian prior to rasterization.
+// 预处理和投影
+// 计算投影圆圈的半径：在3D空间中的高斯分布投影到2D图像平面时，它通常会形成一个圆圈（实际上是椭圆，因为视角的影响）。这个步骤涉及计算这个圆圈的半径。
+// 计算圆圈覆盖的像素数：这涉及到将图像平面分成许多小块（tiles），并计算每个高斯分布投影形成的圆圈与哪些小块相交。这是为了高效地渲染，只更新受影响的小块。
 template<int C>
 __global__ void preprocessCUDA(int P, int D, int M,
 	const float* orig_points,
@@ -179,7 +216,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	uint32_t* tiles_touched,
 	bool prefiltered)
 {
-	auto idx = cg::this_grid().thread_rank();
+	auto idx = cg::this_grid().thread_rank();	// 获取当前线程对应的下标（一个线程处理一个像素）
 	if (idx >= P)
 		return;
 
@@ -189,25 +226,32 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	tiles_touched[idx] = 0;
 
 	// Perform near culling, quit if outside.
+    // 给定指定的相机姿势，确定哪些3D高斯位于相机的视锥体之外。这样做可以确保在后续计算中不涉及给定视图之外的3D高斯，从而节省计算资源。
 	float3 p_view;
 	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
+        // 不在视锥体内，则返回
 		return;
 
 	// Transform point by projecting
+    // 将3D高斯投影到2D图像平面上，存储必要变量以在后续渲染中使用
+	// 1. 3D高斯中心位置从3D变换到2D：包含观测变换、投影变换、视口变换、光栅化
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
+
+	// projmatrix包含了观测变换 * 投影变换，并进行归一化，使得齐次坐标的最后一维是1。这个点现处在正方体中
 	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
 
-	// If 3D covariance matrix is precomputed, use it, otherwise compute
-	// from scaling and rotation parameters. 
+	// 
 	const float* cov3D;
 	if (cov3D_precomp != nullptr)
 	{
+		// 如果3D协方差矩阵已经计算好了，则直接使用它
 		cov3D = cov3D_precomp + idx * 6;
 	}
 	else
 	{
+		// 否则从缩放因子和旋转四元数中计算它
 		computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
 		cov3D = cov3Ds + idx * 6;
 	}
@@ -226,11 +270,13 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// 2D covariance matrix). Use extent to compute a bounding rectangle
 	// of screen-space tiles that this Gaussian overlaps with. Quit if
 	// rectangle covers 0 tiles. 
-	float mid = 0.5f * (cov.x + cov.z);
+	float mid = 0.5f * (cov.x + cov.z); // 计算中间值
+    // 计算特征值
 	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
+    // 计算长轴半径
 	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
-	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
+	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };	// 将相机中心从NDC平面拉回到图像平面
 	uint2 rect_min, rect_max;
 	getRect(point_image, my_radius, rect_min, rect_max, grid);
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
@@ -251,6 +297,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	radii[idx] = my_radius;
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
+    // 前三个将被用于计算高斯的指数部分从而得到 prob（查询点到该高斯的距离->prob，例如，若查询点位于该高斯的中心则 prob 为 1）。最后一个是该高斯本身的密度。
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
@@ -258,6 +305,10 @@ __global__ void preprocessCUDA(int P, int D, int M,
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
+ /**
+  * 渲染计算每个像素的颜色：这是最终的渲染步骤。图像被分割成很多图块，每个图块由多个线程处理，每个线程负责一个像素。在这个过程中，每个像素的颜色是通过考虑所有影响该像素的高斯分布来计算的。
+  * @tparam CHANNELS
+  */
 template <uint32_t CHANNELS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
@@ -292,6 +343,7 @@ renderCUDA(
 	int toDo = range.y - range.x;
 
 	// Allocate storage for batches of collectively fetched data.
+    // 每个线程取一个，并行读数据到 shared memory。然后每个线程都访问该shared memory，读取顺序一致。
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
@@ -340,12 +392,13 @@ renderCUDA(
 			// Obtain alpha by multiplying with Gaussian opacity
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
-			float alpha = min(0.99f, con_o.w * exp(power));
-			if (alpha < 1.0f / 255.0f)
+			float alpha = min(0.99f, con_o.w * exp(power)); // opacity * 像素点出现在这个高斯的几率
+			if (alpha < 1.0f / 255.0f)  // 太小了就当成透明的
 				continue;
-			float test_T = T * (1 - alpha);
+			float test_T = T * (1 - alpha); // alpha合成的系数
+            // 累乘不透明度到一定的值，标记这个像素的渲染结束
 			if (test_T < 0.0001f)
-			{
+            {
 				done = true;
 				continue;
 			}
@@ -366,8 +419,8 @@ renderCUDA(
 	// rendering data to the frame and auxiliary buffers.
 	if (inside)
 	{
-		final_T[pix_id] = T;
-		n_contrib[pix_id] = last_contributor;
+		final_T[pix_id] = T;    // 用于反向传播计算梯度
+		n_contrib[pix_id] = last_contributor;   // 记录数量，用于提前停止计算
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 	}
@@ -386,6 +439,10 @@ void FORWARD::render(
 	const float* bg_color,
 	float* out_color)
 {
+    // 开始进入CUDA并行计算，将image分为多个block，每个block分配一个进程；每个block里面的pixel分配一个线程；
+    // 对于每个block只排序一次，认为block里面的pixel都被block中的所有gaussian影响且顺序一样。
+    // 在forward中，沿camera从前往后遍历gaussian，计算颜色累计值和透明度累计值，直到透明度累计超过1或者遍历完成，然后用背景色和颜色累计值和透明度累计值计算这个pixel的最终颜色。
+    // 在backward中，遍历顺序与forward相反，从（之前记录下来的）最终透明度累计值和其对应的最后一个gaussian开始，从后往前算梯度。
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
 		point_list,
