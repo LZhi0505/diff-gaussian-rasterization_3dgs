@@ -185,36 +185,39 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 	cov3D[5] = Sigma[2][2];
 }
 
-// Perform initial steps for each Gaussian prior to rasterization.
-// 预处理和投影
+
+//! 为每个3D高斯进行预处理的CUDA核函数
 // 计算投影圆圈的半径：在3D空间中的高斯分布投影到2D图像平面时，它通常会形成一个圆圈（实际上是椭圆，因为视角的影响）。这个步骤涉及计算这个圆圈的半径。
 // 计算圆圈覆盖的像素数：这涉及到将图像平面分成许多小块（tiles），并计算每个高斯分布投影形成的圆圈与哪些小块相交。这是为了高效地渲染，只更新受影响的小块。
 template<int C>
-__global__ void preprocessCUDA(int P, int D, int M,
-	const float* orig_points,
-	const glm::vec3* scales,
-	const float scale_modifier,
-	const glm::vec4* rotations,
-	const float* opacities,
-	const float* shs,
-	bool* clamped,
-	const float* cov3D_precomp,
-	const float* colors_precomp,
-	const float* viewmatrix,
-	const float* projmatrix,
-	const glm::vec3* cam_pos,
-	const int W, int H,
-	const float tan_fovx, float tan_fovy,
-	const float focal_x, float focal_y,
-	int* radii,
-	float2* points_xy_image,
-	float* depths,
-	float* cov3Ds,
-	float* rgb,
-	float4* conic_opacity,
-	const dim3 grid,
+__global__ void preprocessCUDA(
+    int P,  // 3D高斯的数量
+    int D,  // 3D高斯的维度
+    int M,  // 点云数量
+	const float* orig_points,   // 三维坐标
+	const glm::vec3* scales,    // 缩放因子
+	const float scale_modifier, // 缩放调整因子
+	const glm::vec4* rotations, // 旋转
+	const float* opacities,     // 不透明
+	const float* shs,           // 球谐系数
+	bool* clamped,              // 用于记录是否被裁剪
+	const float* cov3D_precomp, //预计算的3D协方差矩阵
+	const float* colors_precomp,    // 预计算的颜色
+	const float* viewmatrix,    // 视图矩阵
+	const float* projmatrix,    // 投影矩阵
+	const glm::vec3* cam_pos,   // 相机位置
+	const int W, int H,         // 输出图像的宽、高
+	const float tan_fovx, float tan_fovy,   // 水平和垂直方向的视场角tan值
+	const float focal_x, float focal_y,     // 焦距
+	int* radii,                 // 输出的半径
+	float2* points_xy_image,    // 输出的二维坐标
+	float* depths,              // 输出的深度
+	float* cov3Ds,              // 输出的3D协方差矩阵
+	float* rgb,                 // 输出的颜色
+	float4* conic_opacity,      // 锥形不透明度
+	const dim3 grid,            // CUDA网格的大小
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered)           // 是否预过滤
 {
 	auto idx = cg::this_grid().thread_rank();	// 获取当前线程对应的下标（一个线程处理一个像素）
 	if (idx >= P)
@@ -222,6 +225,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Initialize radius and touched tiles to 0. If this isn't changed,
 	// this Gaussian will not be processed further.
+    // 初始化半径、触及到的瓦片数量为0，如果这个值没有改变，说明这个高斯将不会进行后面的预处理
 	radii[idx] = 0;
 	tiles_touched[idx] = 0;
 
@@ -229,7 +233,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
     // 给定指定的相机姿势，确定哪些3D高斯位于相机的视锥体之外。这样做可以确保在后续计算中不涉及给定视图之外的3D高斯，从而节省计算资源。
 	float3 p_view;
 	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
-        // 不在视锥体内，则返回
+        // 如果该3DGS不在视锥体内，则返回
 		return;
 
 	// Transform point by projecting
@@ -242,24 +246,21 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
 
-	// 
+	// 获取3D协方差矩阵
 	const float* cov3D;
-	if (cov3D_precomp != nullptr)
-	{
-		// 如果3D协方差矩阵已经计算好了，则直接使用它
+	if (cov3D_precomp != nullptr) {
+		// 如果提供了预计算的3D协方差矩阵，则直接使用它
 		cov3D = cov3D_precomp + idx * 6;
-	}
-	else
-	{
-		// 否则从缩放因子和旋转四元数中计算它
+	} else {
+		// 未提供，则从缩放因子和旋转四元数中计算3D协方差矩阵（默认）
 		computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
 		cov3D = cov3Ds + idx * 6;
 	}
 
-	// Compute 2D screen-space covariance matrix
+    // 计算2D协方差矩阵：根据3D协方差矩阵、焦距和视锥体矩阵，计算2D屏幕空间的协方差矩阵
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
 
-	// Invert covariance (EWA algorithm)
+    // 对协方差矩阵进行求逆操作，用于EWA（Elliptical Weighted Average）算法
 	float det = (cov.x * cov.z - cov.y * cov.y);
 	if (det == 0.0f)
 		return;
@@ -269,7 +270,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// Compute extent in screen space (by finding eigenvalues of
 	// 2D covariance matrix). Use extent to compute a bounding rectangle
 	// of screen-space tiles that this Gaussian overlaps with. Quit if
-	// rectangle covers 0 tiles. 
+	// rectangle covers 0 tiles.
+    // 计算2D协方差矩阵的特征值，用于计算屏幕空间的范围，以确定与之相交的瓦片
 	float mid = 0.5f * (cov.x + cov.z); // 计算中间值
     // 计算特征值
 	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
@@ -284,15 +286,15 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// If colors have been precomputed, use them, otherwise convert
 	// spherical harmonics coefficients to RGB color.
-	if (colors_precomp == nullptr)
-	{
+	if (colors_precomp == nullptr) {
+        // 如果未提供预计算的颜色，则球谐系数计算颜色（默认）
 		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
 		rgb[idx * C + 0] = result.x;
 		rgb[idx * C + 1] = result.y;
 		rgb[idx * C + 2] = result.z;
 	}
 
-	// Store some useful helper data for the next steps.
+    // 存储计算的深度、半径、屏幕坐标等结果，用于下一步继续处理
 	depths[idx] = p_view.z;
 	radii[idx] = my_radius;
 	points_xy_image[idx] = point_image;
@@ -302,28 +304,32 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
-// Main rasterization method. Collaboratively works on one tile per
-// block, each thread treats one pixel. Alternates between fetching 
-// and rasterizing data.
- /**
-  * 渲染计算每个像素的颜色：这是最终的渲染步骤。图像被分割成很多图块，每个图块由多个线程处理，每个线程负责一个像素。在这个过程中，每个像素的颜色是通过考虑所有影响该像素的高斯分布来计算的。
-  * @tparam CHANNELS
-  */
+
+//! 光栅化最终的渲染步骤，渲染计算每个像素的颜色。
+// 在一个block上协作，每个线程负责一个像素，在获取数据 与 光栅化数据之间交替。在这个过程中，每个像素的颜色是通过考虑所有影响该像素的高斯来计算的。
+// (1) 通过计算当前线程所属的 tile 的范围，确定当前线程要处理的像素区域
+// (2) 判断当前线程是否在有效像素范围内，如果不在，则将 done 设置为 true，表示该线程不执行渲染操作
+// (3) 使用 __syncthreads_count 函数，统计当前块内 done 变量为 true 的线程数，如果全部线程都完成，跳出循环
+// (4) 在每个迭代中，从全局内存中收集每个线程块对应的范围内的数据，包括点的索引、2D 坐标和锥体参数透明度。
+// (5) 对当前线程块内的每个点，进行基于锥体参数的渲染，计算贡献并更新颜色。
+// (6) 所有线程处理完毕后，将渲染结果写入 final_T、n_contrib 和 out_color
 template <uint32_t CHANNELS>
-__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)    // CUDA 启动核函数时使用的线程格和线程块的数量
 renderCUDA(
-	const uint2* __restrict__ ranges,
-	const uint32_t* __restrict__ point_list,
+	const uint2* __restrict__ ranges,   // 包含每个范围的起始和结束索引的数组
+	const uint32_t* __restrict__ point_list,    // 包含了点的索引的数组f
 	int W, int H,
-	const float2* __restrict__ points_xy_image,
-	const float* __restrict__ features,
-	const float4* __restrict__ conic_opacity,
-	float* __restrict__ final_T,
-	uint32_t* __restrict__ n_contrib,
-	const float* __restrict__ bg_color,
-	float* __restrict__ out_color)
+	const float2* __restrict__ points_xy_image, // 包含每个点在屏幕上的坐标的数组
+	const float* __restrict__ features,         // 包含每个点的颜色信息的数组
+	const float4* __restrict__ conic_opacity,   // 包含每个点的锥体参数和透明度信息的数组
+	float* __restrict__ final_T,                // 用于存储每个像素的最终颜色的数组。（多个叠加？）
+	uint32_t* __restrict__ n_contrib,           // 用于存储每个像素的贡献计数的数组
+	const float* __restrict__ bg_color,         // 如果提供了背景颜色，将其作为背景
+	float* __restrict__ out_color)              //存储最终渲染结果的数组
 {
 	// Identify current tile and associated min/max pixel range.
+    // 1.确定当前像素范围：
+    // 这部分代码用于确定当前线程块要处理的像素范围，包括 pix_min 和 pix_max，并计算当前线程对应的像素坐标 pix
 	auto block = cg::this_thread_block();
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
 	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
@@ -333,36 +339,47 @@ renderCUDA(
 	float2 pixf = { (float)pix.x, (float)pix.y };
 
 	// Check if this thread is associated with a valid pixel or outside.
+    // 2.判断当前线程是否在有效像素范围内：
+    // 根据像素坐标判断当前线程是否在有效的图像范围内，如果不在，则将 done 设置为 true，表示该线程无需执行渲染操作
 	bool inside = pix.x < W&& pix.y < H;
 	// Done threads can help with fetching, but don't rasterize
 	bool done = !inside;
 
 	// Load start/end range of IDs to process in bit sorted list.
+    // 3.加载点云数据处理范围：
+    // 这部分代码加载当前线程块要处理的点云数据的范围，即 ranges 数组中对应的范围，并计算点云数据的迭代批次 rounds 和总共要处理的点数 toDo
 	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
 	int toDo = range.y - range.x;
 
 	// Allocate storage for batches of collectively fetched data.
+    // 4. 初始化共享内存，分别定义三个共享内存数组，用于在每个线程块内共享数据
     // 每个线程取一个，并行读数据到 shared memory。然后每个线程都访问该shared memory，读取顺序一致。
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 
 	// Initialize helper variables
+    // 5.初始化渲染相关变量：
+    // 初始化渲染所需的一些变量，包括当前像素颜色 C、贡献者数量
 	float T = 1.0f;
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
 
 	// Iterate over batches until all done or range is complete
-	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
-	{
+    // 6.迭代处理点云数据：
+    // 在每个迭代中，处理一批点云数据。内部循环迭代每个点，进行基于锥体参数的渲染计算，并更新颜色信息
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE) {
+        // 代码使用 rounds 控制循环的迭代次数，每次迭代处理一批点云数据
 		// End if entire block votes that it is done rasterizing
 		int num_done = __syncthreads_count(done);
 		if (num_done == BLOCK_SIZE)
 			break;
 
 		// Collectively fetch per-Gaussian data from global to shared
+        // 共享内存中获取点云数据：
+        // 每个线程通过索引 progress 计算要加载的点云数据的索引 coll_id，然后从全局内存中加载到共享内存 collected_id、collected_xy 和 collected_conic_opacity 中。block.sync() 确保所有线程都加载完成
 		int progress = i * BLOCK_SIZE + block.thread_rank();
 		if (range.x + progress < range.y)
 		{
@@ -374,13 +391,17 @@ renderCUDA(
 		block.sync();
 
 		// Iterate over current batch
-		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
-		{
+        // 迭代处理当前批次的点云数据
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++) {
+            //在当前批次的循环中，每个线程处理一条点云数据
 			// Keep track of current position in range
 			contributor++;
 
 			// Resample using conic matrix (cf. "Surface 
 			// Splatting" by Zwicker et al., 2001)
+            // 计算当前点的投影坐标与锥体参数的差值：
+            // 计算当前点在屏幕上的坐标 xy 与当前像素坐标 pixf 的差值，并使用锥体参数计算 power。
+            // Resample using conic matrix (cf. "Surface
 			float2 xy = collected_xy[j];
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			float4 con_o = collected_conic_opacity[j];
@@ -391,19 +412,20 @@ renderCUDA(
 			// Eq. (2) from 3D Gaussian splatting paper.
 			// Obtain alpha by multiplying with Gaussian opacity
 			// and its exponential falloff from mean.
-			// Avoid numerical instabilities (see paper appendix). 
+			// Avoid numerical instabilities (see paper appendix).
+            // 计算论文中公式2的 alpha
 			float alpha = min(0.99f, con_o.w * exp(power)); // opacity * 像素点出现在这个高斯的几率
 			if (alpha < 1.0f / 255.0f)  // 太小了就当成透明的
 				continue;
 			float test_T = T * (1 - alpha); // alpha合成的系数
             // 累乘不透明度到一定的值，标记这个像素的渲染结束
-			if (test_T < 0.0001f)
-            {
+			if (test_T < 0.0001f) {
 				done = true;
 				continue;
 			}
 
 			// Eq. (3) from 3D Gaussian splatting paper.
+            // 使用3D高斯进行渲染计算：更新颜色信息 C
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
 
@@ -417,8 +439,9 @@ renderCUDA(
 
 	// All threads that treat valid pixel write out their final
 	// rendering data to the frame and auxiliary buffers.
-	if (inside)
-	{
+	if (inside) {
+        //7. 写入最终渲染结果：
+        // 如果当前线程在有效像素范围内，则将最终的渲染结果写入相应的缓冲区，包括 final_T、n_contrib 和 out_color
 		final_T[pix_id] = T;    // 用于反向传播计算梯度
 		n_contrib[pix_id] = last_contributor;   // 记录数量，用于提前停止计算
 		for (int ch = 0; ch < CHANNELS; ch++)
@@ -426,6 +449,7 @@ renderCUDA(
 	}
 }
 
+// 渲染的主函数
 void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
@@ -456,6 +480,7 @@ void FORWARD::render(
 		out_color);
 }
 
+// 预处理
 void FORWARD::preprocess(int P, int D, int M,
 	const float* means3D,
 	const glm::vec3* scales,
@@ -482,6 +507,8 @@ void FORWARD::preprocess(int P, int D, int M,
 	uint32_t* tiles_touched,
 	bool prefiltered)
 {
+    // 调用CUDA核函数 preprocessCUDA为每个高斯进行预处理，为后续的光栅化做好准备
+    // CUDA核函数的执行由函数参数确定。在CUDA核函数中，每个线程块由多个线程组成，负责处理其中的一部分数据，从而加速高斯光栅化的计算
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
 		means3D,
