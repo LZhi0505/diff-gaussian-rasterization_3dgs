@@ -15,10 +15,22 @@
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
-// 核函数使用__global__修饰符声明。这表明这个函数是一个核函数，它可以在GPU上执行，而不是在CPU上执行
-// 当调用一个核函数时，需要使用特殊的语法<<<grid, block>>>来指定执行配置。这个配置包括两个部分：
-// Grid：是指定了多少个块（block）组成的网格（grid）。整个网格代表了所有的并行执行单元的集合。
-// Block：是指每个块中包含多少个线程。块内的线程可以共享数据并协作执行任务。
+/**
+ * OpenGL Mathematics(glm)：是针对图形编程的数学库，用于OpenGL的开发，这个库基于C++的模板库。
+ * 提供了各种数学功能和数据结构：
+ * 向量（vec2, vec3, vec4）
+ * 矩阵（mat2, mat3, mat4）
+ * 四元数（quaterion）
+ * 常见的数学函数（平移、旋转、缩放、透视投影等）
+ */
+
+/**
+ * 核函数使用__global__修饰符声明。这表明这个函数是一个核函数，它可以在GPU上执行，而不能在CPU上执行。
+ * 当调用一个核函数时，需要使用特殊的语法<<<grid, block>>>来指定执行配置。
+ * 这个配置包括两个部分：
+ * Grid：是指定了多少个块（block）组成的网格（grid），整个网格代表了所有并行执行单元的集合；
+ * Block：是指每个块中包含多少个线程。块内的线程可以共享数据并协作执行任务。
+ */
 
 // Forward method for converting the input spherical harmonics
 // coefficients of each Gaussian to a simple RGB color.
@@ -146,25 +158,30 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 	return { float(cov[0][0]), float(cov[0][1]), float(cov[1][1]) };
 }
 
-// Forward method for converting scale and rotation properties of each
-// Gaussian to a 3D covariance matrix in world space. Also takes care
-// of quaternion normalization.
+/**
+ * 前向传播中的方法：
+ *     将每个3D高斯的旋转和缩放 转换为 世界坐标系下的3D协方差矩阵（需注意旋转四元数的归一化）
+ * @param scale 缩放因子
+ * @param mod   缩放因子调整系数
+ * @param rot   旋转四元数
+ * @param cov3D 输出的协方差矩阵
+ */
 __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 rot, float* cov3D)
 {
-	// Create scaling matrix
-	glm::mat3 S = glm::mat3(1.0f);
-	S[0][0] = mod * scale.x;
+	// 创建 缩放矩阵(3x3)
+	glm::mat3 S = glm::mat3(1.0f);  // 初始化为一个3维的单位阵
+	S[0][0] = mod * scale.x;    // 将缩放因子填入主对角线元素中
 	S[1][1] = mod * scale.y;
 	S[2][2] = mod * scale.z;
 
-	// Normalize quaternion to get valid rotation
+	// 将输入的四元数归一化 以正确表示 旋转
 	glm::vec4 q = rot;// / glm::length(rot);
 	float r = q.x;
 	float x = q.y;
 	float y = q.z;
 	float z = q.w;
 
-	// Compute rotation matrix from quaternion
+	// 四元数 => 旋转矩阵(3x3)
 	glm::mat3 R = glm::mat3(
 		1.f - 2.f * (y * y + z * z), 2.f * (x * y - r * z), 2.f * (x * z + r * y),
 		2.f * (x * y + r * z), 1.f - 2.f * (x * x + z * z), 2.f * (y * z - r * x),
@@ -173,10 +190,10 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 
 	glm::mat3 M = S * R;
 
-	// Compute 3D world covariance matrix Sigma
+	// 计算世界坐标系下的 协方差矩阵(3x3)：R^T S^T S R
 	glm::mat3 Sigma = glm::transpose(M) * M;
 
-	// Covariance is symmetric, only store upper right
+	// 因为协方差矩阵是对阵矩阵，因此只存储上半角元素
 	cov3D[0] = Sigma[0][0];
 	cov3D[1] = Sigma[0][1];
 	cov3D[2] = Sigma[0][2];
@@ -196,7 +213,7 @@ __global__ void preprocessCUDA(
     int M,  // 点云数量
 	const float* orig_points,   // 三维坐标
 	const glm::vec3* scales,    // 缩放因子
-	const float scale_modifier, // 缩放调整因子
+	const float scale_modifier, // 缩放因子的调整系数
 	const glm::vec4* rotations, // 旋转
 	const float* opacities,     // 不透明
 	const float* shs,           // 球谐系数
@@ -252,7 +269,7 @@ __global__ void preprocessCUDA(
 		// 如果提供了预计算的3D协方差矩阵，则直接使用它
 		cov3D = cov3D_precomp + idx * 6;
 	} else {
-		// 未提供，则从缩放因子和旋转四元数中计算3D协方差矩阵（默认）
+		// 默认未提供，则从缩放因子和旋转四元数中计算世界坐标系下的 3D协方差矩阵
 		computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
 		cov3D = cov3Ds + idx * 6;
 	}
