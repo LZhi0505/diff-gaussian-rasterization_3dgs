@@ -101,14 +101,14 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
  * 3DGS协方差矩阵 -> 2D的变换:
  * 1. 世界坐标系到相机坐标：viewmatirx
  * 2. 视锥到立方体：雅克比矩阵
- * @param mean      3DGS的世界坐标系下的中心位置
- * @param focal_x   相机的焦距，物体离相机的远近等比例缩小
+ * @param mean      3D高斯中心的世界坐标
+ * @param focal_x   相机在焦x轴方向上的焦距，也是视锥体近平面的深度
  * @param focal_y
  * @param tan_fovx
  * @param tan_fovy
- * @param cov3D     世界坐标系下3G高斯的协方差矩阵
- * @param viewmatrix 世界坐标系到相机坐标系的变换矩阵
- * @return
+ * @param cov3D     世界坐标系下的3G高斯的协方差矩阵
+ * @param viewmatrix 观测变换矩阵，即世界坐标系 ==> 相机坐标系
+ * @return 像素坐标系下的协方差矩阵，维度为(2,2)，但只返回了上半角元素(3个)
  */
 __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y, float tan_fovx, float tan_fovy, const float* cov3D, const float* viewmatrix)
 {
@@ -117,7 +117,7 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 	// Additionally considers aspect / scaling of viewport.
 	// Transposes used to account for row-/column-major conventions.
 	// 雅克比矩阵在一个点附近才满足使用线性变换 近似 非线性变换的条件，而高斯的中心位置就是这个点，所以先求得3D高斯在相机坐标系下的位置）
-	// 计算t在视锥中的位置
+	// 计算3D高斯中心在相机坐标系中的位置（在视锥中的位置）
 	float3 t = transformPoint4x3(mean, viewmatrix);
 
 	const float limx = 1.3f * tan_fovx;
@@ -127,32 +127,32 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 	t.x = min(limx, max(-limx, txtz)) * t.z;
 	t.y = min(limy, max(-limy, tytz)) * t.z;
 
-	// 构建雅克比矩阵（透视变换 = 视椎体压成立方体 + 视口变换）
+	// 构建雅克比矩阵（投影变换中的将视椎体压成立方体）
 	glm::mat3 J = glm::mat3(
 		focal_x / t.z, 0.0f, -(focal_x * t.x) / (t.z * t.z),
 		0.0f, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
 		0, 0, 0);
 
-	// W：世界到相机的旋转矩阵 的 转置
+	// W：世界坐标系 ==> 相机坐标系的旋转矩阵 的转置
 	glm::mat3 W = glm::mat3(
 		viewmatrix[0], viewmatrix[4], viewmatrix[8],
 		viewmatrix[1], viewmatrix[5], viewmatrix[9],
 		viewmatrix[2], viewmatrix[6], viewmatrix[10]);
 
-	glm::mat3 T = W * J;	// 协方差矩阵从3D变为2D的公式中右边的部分
-
+    // 协方差矩阵从3D变为2D的公式：V_2D = JW V_3D W^T J^T
+	glm::mat3 T = W * J;
+    // 3D协方差矩阵
 	glm::mat3 Vrk = glm::mat3(
 		cov3D[0], cov3D[1], cov3D[2],
 		cov3D[1], cov3D[3], cov3D[4],
 		cov3D[2], cov3D[4], cov3D[5]);
 
-	// 2D协方差矩阵
+	// 2D协方差矩阵 = J^T W V_3D^T W^T J
 	// [sigma_x sigma_xy]
 	// [sigma_xy sigma_y]
 	glm::mat3 cov = glm::transpose(T) * glm::transpose(Vrk) * T;
 
-	// Apply low-pass filter: every Gaussian should be at least
-	// one pixel wide/high. Discard 3rd row and column.
+	// 进行低通滤波: 每个高斯应该在像素坐标系上的宽和高至少占1个像素上（忽略第三行和第三列）
 	cov[0][0] += 0.3f;
 	cov[1][1] += 0.3f;
 	return { float(cov[0][0]), float(cov[0][1]), float(cov[1][1]) };
@@ -220,8 +220,8 @@ __global__ void preprocessCUDA(
 	bool* clamped,              // 用于记录是否被裁剪
 	const float* cov3D_precomp, //预计算的3D协方差矩阵
 	const float* colors_precomp,    // 预计算的颜色
-	const float* viewmatrix,    // 视图矩阵
-	const float* projmatrix,    // 投影矩阵
+	const float* viewmatrix,    // 观测变换矩阵
+	const float* projmatrix,    // 观测变换矩阵 * 投影变换矩阵
 	const glm::vec3* cam_pos,   // 相机位置
 	const int W, int H,         // 输出图像的宽、高
 	const float tan_fovx, float tan_fovy,   // 水平和垂直方向的视场角tan值
@@ -254,16 +254,18 @@ __global__ void preprocessCUDA(
 		return;
 
 	// Transform point by projecting
-    // 将3D高斯投影到2D图像平面上，存储必要变量以在后续渲染中使用
-	// 1. 3D高斯中心位置从3D变换到2D：包含观测变换、投影变换、视口变换、光栅化
+    // 将当前3D高斯idx投影到2D图像平面上
+	// 1. 将3D高斯的 中心 从3D变换到2D：包含观测变换、投影变换、视口变换、光栅化
+    // 1.1 该3D高斯中心的世界坐标
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
-
-	// projmatrix包含了观测变换 * 投影变换，并进行归一化，使得齐次坐标的最后一维是1。这个点现处在正方体中
-	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
+	// 1.2 中心：世界坐标系 ==> NDC坐标系，转换后该点处于[-1,1]的正方体中
+	float4 p_hom = transformPoint4x4(p_orig, projmatrix);   // projmatrix = 观测变换 * 投影变换
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
+    // 1.3 归一化后的、在NDC坐标系中的高斯中心
 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
 
-	// 获取3D协方差矩阵
+    // 2. 将3D高斯的 协方差矩阵 从3D变换到2D：包含观测变换(viewmatrix)、投影变换中的视锥到立方体的变换(雅可比矩阵)
+	// 2.1 获取3D协方差矩阵
 	const float* cov3D;
 	if (cov3D_precomp != nullptr) {
 		// 如果提供了预计算的3D协方差矩阵，则直接使用它
@@ -273,8 +275,8 @@ __global__ void preprocessCUDA(
 		computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
 		cov3D = cov3Ds + idx * 6;
 	}
-
-    // 计算2D协方差矩阵：根据3D协方差矩阵、焦距和视锥体矩阵，计算2D屏幕空间的协方差矩阵
+    // 2.2 协方差矩阵：世界坐标系 ==观测变换==> 相机坐标系 ==投影变换中视锥到立方体==> 立方体中
+    // 2D协方差矩阵的上半角元素(3个)
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
 
     // 对协方差矩阵进行求逆操作，用于EWA（Elliptical Weighted Average）算法

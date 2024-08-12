@@ -55,6 +55,11 @@ __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& r
 	};
 }
 
+/**
+ * 将3D高斯中心从世界坐标系变换到相机坐标系，即 x = matrix * p
+ * p: 该3D高斯中心的世界坐标
+ * matrix: 观测变换
+ */
 __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float* matrix)
 {
 	float3 transformed = {
@@ -65,6 +70,11 @@ __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float
 	return transformed;
 }
 
+/**
+ * 将3D高斯中心从世界坐标系变换到NDC坐标系，即 x = matrix * p
+ * p: 该3D高斯中心的世界坐标
+ * matrix: 观测变换 * 投影变换
+ */
 __forceinline__ __device__ float4 transformPoint4x4(const float3& p, const float* matrix)
 {
 	float4 transformed = {
