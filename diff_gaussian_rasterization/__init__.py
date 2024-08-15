@@ -201,7 +201,7 @@ class GaussianRasterizer(nn.Module):
     def markVisible(self, positions):
         """
         基于当前相机的视锥体，返回3D高斯是否在当前相机视野中是否可见的mask（使用C++/CUDA代码执行）
-        :param positions: 3D高斯的中心位置
+            positions: 3D高斯的中心位置
         """
         with torch.no_grad():
             raster_settings = self.raster_settings

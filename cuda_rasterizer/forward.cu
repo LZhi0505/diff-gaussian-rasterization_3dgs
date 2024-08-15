@@ -37,7 +37,7 @@ namespace cg = cooperative_groups;
 /**
  * 计算3D高斯的颜色
  * @param idx
- * @param deg 球屑函数的阶数
+ * @param deg 球谐函数的阶数
  * @param max_coeffs
  * @param means 所有高斯的中心位置
  * @param campos 相机中心位置
@@ -52,18 +52,18 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 	glm::vec3 dir = pos - campos;	// 从相机中心指向当前高斯的 方向
 	dir = dir / glm::length(dir);
 
-	glm::vec3* sh = ((glm::vec3*)shs) + idx * max_coeffs;
-	glm::vec3 result = SH_C0 * sh[0];
-	// SH_C1等是球谐函数的基函数，sh是球谐系数(16, 3)
-	if (deg > 0)
-	{
+	glm::vec3* sh = ((glm::vec3*)shs) + idx * max_coeffs;   // 获取当前高斯的球谐系数(16, 3)
+	glm::vec3 result = SH_C0 * sh[0];                       // 计算0阶系数的颜色值
+	// SH_C1等是球谐函数的基函数
+	if (deg > 0) {
+        // 阶数 > 0，则计算一阶SH系数的颜色值
 		float x = dir.x;
 		float y = dir.y;
 		float z = dir.z;
 		result = result - SH_C1 * y * sh[1] + SH_C1 * z * sh[2] - SH_C1 * x * sh[3];
 
-		if (deg > 1)
-		{
+		if (deg > 1) {
+            // 阶数 > 1，则计算二阶SH系数的颜色值
 			float xx = x * x, yy = y * y, zz = z * z;
 			float xy = x * y, yz = y * z, xz = x * z;
 			result = result +
@@ -73,8 +73,8 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 				SH_C2[3] * xz * sh[7] +
 				SH_C2[4] * (xx - yy) * sh[8];
 
-			if (deg > 2)
-			{
+			if (deg > 2) {
+                // 阶数 > 2，则计算三阶SH系数的颜色值
 				result = result +
 					SH_C3[0] * y * (3.0f * xx - yy) * sh[9] +
 					SH_C3[1] * xy * z * sh[10] +
@@ -86,10 +86,12 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 			}
 		}
 	}
+    // 为结果颜色值加上一个偏移量
 	result += 0.5f;
 
 	// RGB colors are clamped to positive values. If values are
 	// clamped, we need to keep track of this for the backward pass.
+    // 将RGB颜色值限制在正值范围内。如果被限制，则需要在反向传播过程中记录此信息。
 	clamped[3 * idx + 0] = (result.x < 0);
 	clamped[3 * idx + 1] = (result.y < 0);
 	clamped[3 * idx + 2] = (result.z < 0);
@@ -306,7 +308,7 @@ __global__ void preprocessCUDA(
 	// If colors have been precomputed, use them, otherwise convert
 	// spherical harmonics coefficients to RGB color.
 	if (colors_precomp == nullptr) {
-        // 如果未提供预计算的颜色，则球谐系数计算颜色（默认）
+        // （默认）如果未提供预计算的颜色，则球谐系数计算颜色
 		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
 		rgb[idx * C + 0] = result.x;
 		rgb[idx * C + 1] = result.y;
