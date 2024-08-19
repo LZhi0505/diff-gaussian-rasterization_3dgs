@@ -199,37 +199,9 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
 	return binning;
 }
 
-// Forward rendering procedure for differentiable rasterization
-// of Gaussians.
+// Forward rendering procedure for differentiable rasterization of Gaussians.
 /**
  * 高斯可微光栅化的前向渲染处理，该函数可当作 main 函数
- * @param geometryBuffer
- * @param binningBuffer
- * @param imageBuffer
- * @param P
- * @param D
- * @param M
- * @param background
- * @param width
- * @param height
- * @param means3D
- * @param shs
- * @param colors_precomp
- * @param opacities
- * @param scales
- * @param scale_modifier
- * @param rotations
- * @param cov3D_precomp
- * @param viewmatrix
- * @param projmatrix
- * @param cam_pos
- * @param tan_fovx
- * @param tan_fovy
- * @param prefiltered
- * @param out_color
- * @param radii
- * @param debug
- * @return
  */
 int CudaRasterizer::Rasterizer::forward(
 	std::function<char* (size_t)> geometryBuffer,
@@ -281,6 +253,7 @@ int CudaRasterizer::Rasterizer::forward(
 	}
 
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
+    // 光栅化之前，对每个高斯进行预处理
 	CHECK_CUDA(FORWARD::preprocess(
 		P, D, M,
 		means3D,

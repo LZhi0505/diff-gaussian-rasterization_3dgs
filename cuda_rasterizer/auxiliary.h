@@ -38,17 +38,34 @@ __device__ const float SH_C3[] = {
 	-0.5900435899266435f
 };
 
+
+/**
+ * 高斯中心的NDC坐标 ==> 图像坐标
+ * v: NDC的x/y坐标
+ * S: 放大到图像尺寸的W/H
+ */
 __forceinline__ __device__ float ndc2Pix(float v, int S)
 {
 	return ((v + 1.0) * S - 1.0) * 0.5;
 }
 
+/**
+ * 计算该高斯在图像平面的影响范围（左上角和右下角坐标）对应在CUDA块级别的最小和最大边界
+ * p:           该高斯中心在图像平面的二维坐标
+ * max_radius:  该高斯在图像平面的最大投影半径
+ * rect_min:    输出的 最小矩形的左上角坐标（块级别）
+ * rect_max:    输出的 最小矩形的右下角坐标（块级别）
+ * grid:        CUDA网格的维度，grid.x 是网格在x方向上的块数，grid.y 是网格在y方向上的块数
+ */
 __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& rect_min, uint2& rect_max, dim3 grid)
 {
+    // BLOCK_X 和 BLOCK_Y 表示CUDA中每个块在图像中的宽度和高度（即每个块包含的像素数量）
+    // 左上角（0 < 该高斯投影在x方向上的左边界 转换为 块坐标 < grid.x；0 < 该高斯投影在y方向上的上边界 转换为 块坐标 < grid.y）
 	rect_min = {
 		min(grid.x, max((int)0, (int)((p.x - max_radius) / BLOCK_X))),
 		min(grid.y, max((int)0, (int)((p.y - max_radius) / BLOCK_Y)))
 	};
+    // 右下角
 	rect_max = {
 		min(grid.x, max((int)0, (int)((p.x + max_radius + BLOCK_X - 1) / BLOCK_X))),
 		min(grid.y, max((int)0, (int)((p.y + max_radius + BLOCK_Y - 1) / BLOCK_Y)))
@@ -56,7 +73,7 @@ __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& r
 }
 
 /**
- * 将3D高斯中心从世界坐标系变换到相机坐标系，即 x = matrix * p
+ * 将该高斯中心从 世界坐标系 变换到 相机坐标系，即 x = matrix * p
  * p: 该3D高斯中心的世界坐标
  * matrix: 观测变换
  */
@@ -71,9 +88,9 @@ __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float
 }
 
 /**
- * 将3D高斯中心从世界坐标系变换到NDC坐标系，即 x = matrix * p
- * p: 该3D高斯中心的世界坐标
- * matrix: 观测变换 * 投影变换
+ * 将该高斯中心从 世界坐标系 变换到 NDC坐标系，即 x = matrix * p
+ * p: 该高斯中心的世界坐标
+ * matrix: 观测变换 * 投影变换，(4,4)
  */
 __forceinline__ __device__ float4 transformPoint4x4(const float3& p, const float* matrix)
 {
@@ -146,23 +163,31 @@ __forceinline__ __device__ float sigmoid(float x)
 	return 1.0f / (1.0f + expf(-x));
 }
 
-__forceinline__ __device__ bool in_frustum(int idx,
-	const float* orig_points,
-	const float* viewmatrix,
-	const float* projmatrix,
-	bool prefiltered,
-	float3& p_view)
-{
-	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
 
-	// Bring points to screen space
+/**
+ * 检查该高斯是否在当前相机的视锥体内
+ */
+__forceinline__ __device__ bool in_frustum(int idx, // 该高斯的索引
+	const float* orig_points,   // 所有高斯 中心的世界坐标坐标
+	const float* viewmatrix,    // 观测变换矩阵
+	const float* projmatrix,    // 观测变换矩阵 * 投影变换矩阵
+	bool prefiltered,           // 是否进行预过滤的标志
+	float3& p_view)             // 输出的 该高斯在相机坐标系下的位置
+{
+	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };   // 该高斯中心的世界坐标
+
+    // 该高斯中心坐标从 世界坐标系 ==> NDC坐标系（4维齐次坐标）
 	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
+    // 映射到范围为[-1,1]的正方体中的三维坐标
 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
-	p_view = transformPoint4x3(p_orig, viewmatrix);
+
+    // 该高斯中心坐标从 世界坐标系 ==> 相机坐标系
+    p_view = transformPoint4x3(p_orig, viewmatrix);
 
 	if (p_view.z <= 0.2f)// || ((p_proj.x < -1.3 || p_proj.x > 1.3 || p_proj.y < -1.3 || p_proj.y > 1.3)))
 	{
+        // 深度值非常小，接近相机，则认为不在视锥体内
 		if (prefiltered)
 		{
 			printf("Point is filtered although prefiltered is set. This shouldn't happen!");
