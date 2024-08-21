@@ -19,7 +19,7 @@ def cpu_deep_copy_tuple(input_tuple):
     return tuple(copied_tensors)
 
 
-# 调用自定义的_RasterizeGaussians的apply方法，其继承自torch.autograd.Function，需自己写forward和backward，并传递了一系列参数进行高斯光栅化
+# 调用自定义的_RasterizeGaussians的apply方法
 def rasterize_gaussians(
     means3D,    # 高斯分布的三维坐标
     means2D,    # 高斯分布的二维坐标（屏幕空间坐标）
@@ -45,16 +45,19 @@ def rasterize_gaussians(
 
 class _RasterizeGaussians(torch.autograd.Function):
     """
-    自定义的、继承自torch.autograd.Function的类，用于高斯光栅化的前向传播和反向传播，需重写forward和backward
-    backward函数 和 forward函数输入输出需要相对应：
+    该类继承自torch.autograd.Function自动微分类，所以需重写 forward和 backward，用于高斯光栅化的前向传播和反向传播
+    forward：自定义操作执行计算，输入参数，返回输出
+    backward：如何计算自定义操作相对于其输入的梯度，根据前向传播的结果和外部梯度计算输入张量的梯度
+
+    forward和 backward函数的输入输出需要相对应：
         forward输出了color, radii，则 backward输入ctx, grad_out_color, 也就是上下文信息和两个forward输出的变量的grad；
         forward输入了除ctx外9个变量，则 backward返回9个梯度，不需要梯度的变量用None占位
 
-    forward 和 backward中调用了_C.rasterize_gaussians 和 _C.rasterize_gaussians_backward，这是C函数，其桥梁在文件./submodules/diff-gaussian-rasterization/ext.cpp中定义；
+    forward和 backward中分别调用了 _C.rasterize_gaussians和 _C.rasterize_gaussians_backward，这是C函数，其桥梁在文件./submodules/diff-gaussian-rasterization/ext.cpp中定义；
     即
     """
     @staticmethod
-    # 定义前向渲染的规则，调用C++/CUDA实现的 _C.rasterize_gaussians 方法进行高斯光栅化
+    # 定义前向渲染的规则，调用C++/CUDA实现的 _C.rasterize_gaussians方法进行高斯光栅化
     # 输入：除ctx外的9个参数
     # 输出：color, radii
     def forward(
@@ -104,7 +107,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
-            # 默认，调用C++/CUDA实现的 _C.rasterize_gaussians 方法进行高斯光栅化
+            # 默认不是debug模式，则直接调用C++/CUDA实现的 _C.rasterize_gaussians方法进行高斯光栅化
             num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
 
         # Keep relevant tensors for backward

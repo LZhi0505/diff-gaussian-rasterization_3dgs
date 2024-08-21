@@ -24,14 +24,6 @@ namespace cg = cooperative_groups;
  * 常见的数学函数（平移、旋转、缩放、透视投影等）
  */
 
-/**
- * 核函数使用__global__修饰符声明。这表明这个函数是一个核函数，它可以在GPU上执行，而不能在CPU上执行。
- * 当调用一个核函数时，需要使用特殊的语法<<<grid, block>>>来指定执行配置。
- * 这个配置包括两个部分：
- * Grid：是指定了多少个块（block）组成的网格（grid），整个网格代表了所有并行执行单元的集合；
- * Block：是指每个块中包含多少个线程。块内的线程可以共享数据并协作执行任务。
- */
-
 // Forward method for converting the input spherical harmonics
 // coefficients of each Gaussian to a simple RGB color.
 /**
@@ -300,7 +292,7 @@ __global__ void preprocessCUDA(
     // 该高斯中心在图像平面的二维坐标（从 NDC平面 拉回到 图像平面）
     float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
 
-    // 计算该高斯投影在图像平面的影响范围（左上角和右下角坐标）对应在CUDA块（投影矩形）的边界
+    // 计算该高斯投影最大半径画的圆 在图像平面的影响范围（左上角和右下角坐标）对应在CUDA块（投影矩形）的边界
 	uint2 rect_min, rect_max;
 	getRect(point_image, my_radius, rect_min, rect_max, grid);
 
@@ -322,7 +314,7 @@ __global__ void preprocessCUDA(
 	radii[idx] = my_radius; // 该高斯投影到屏幕空间的最大半径
 	points_xy_image[idx] = point_image; // 该高斯中心在像素平面的坐标
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };     // 该高斯的2D协方差的逆、透明度
-	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x); // 该高斯投影在屏幕空间覆盖的tile数量，用于渲染的优化
+	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x); // 该高斯投影最大半径画的圆 在屏幕空间覆盖的tile数量，用于渲染的优化
 }
 
 
@@ -501,7 +493,11 @@ void FORWARD::render(
 		out_color);
 }
 
-//! 光栅化之前，对每个高斯进行预处理
+/**
+ * 调用CUDA核函数 preprocessCUDA对每个高斯进行预处理和投影
+ * (1) 计算高斯投影到图像平面的最大半径 radii
+ * (2) 计算投影椭圆涉及到的tile的坐标和个数，以高效渲染
+ */
 void FORWARD::preprocess(
     int P, int D, int M,    // 所有高斯的个数，高斯的维度，点云数量
 	const float* means3D,   // 所有高斯 中心的世界坐标
@@ -529,8 +525,16 @@ void FORWARD::preprocess(
 	uint32_t* tiles_touched,    // 输出的 所有高斯 覆盖的tile数量 数组
 	bool prefiltered)       // 是否进行预过滤的标志
 {
-    // 调用CUDA核函数 preprocessCUDA 为每个高斯进行预处理，为后续的光栅化做好准备
-    // CUDA核函数的执行由函数参数确定。在CUDA核函数中，每个线程块由多个线程组成，负责处理其中的一部分数据，从而加速高斯光栅化的计算
+    /**
+     * 核函数使用__global__修饰符声明。这表明该函数是一个核函数（只能在 GPU上执行，不能在 CPU上执行）
+     * 调用核函数时，需要使用特殊语法 << <numBlocks, blockSize> >>(data) 来指定执行配置
+     * 这个配置包括两个部分：
+     *    numBlocks：指定了多少个块（block）组成网格（grid），整个网格代表了所有并行执行单元的集合；
+     *    blockSize：每个块中有多少个线程。块内的线程可以共享数据并协作执行任务。
+     *
+     * 线程ID：在CUDA核函数中，每个线程都会被分配一个唯一的线程ID。这个ID用于区分同一个核函数中不同的执行线程，使得每个线程可以处理数据的不同部分。例如，在处理数组时，线程ID可以用来确定每个线程负责处理数组中的哪个元素。
+     * 获取线程ID：线程ID可以通过核函数的内置变量threadIdx来获取。在一维配置中，threadIdx.x表示当前线程的ID。如果使用二维或三维的块配置，还可以使用threadIdx.y和threadIdx.z。
+     */
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
 		means3D,

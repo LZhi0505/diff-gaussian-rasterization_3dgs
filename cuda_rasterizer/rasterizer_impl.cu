@@ -31,11 +31,6 @@ namespace cg = cooperative_groups;
 #include "backward.h"
 
 
-/**
- * 高斯排序和合成顺序（rasterizer_impl.cu）
- * 计算每个高斯的前后顺序（Alpha合成）：当多个高斯分布重叠在同一区域时，需要确定它们在图像上的渲染顺序，这通常基于它们距离摄像机的远近来决定。
- */
-
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
 uint32_t getHigherMsb(uint32_t n)
@@ -239,7 +234,9 @@ int CudaRasterizer::Rasterizer::forward(
 		radii = geomState.internal_radii;
 	}
 
+    // 计算网格的大小，即所需的线程块数量 tile_grid，包含W/16 * H/16个线程块，是个二维结构
 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+    // 定义一个线程块 block，是16*16的二维结构，处理图象中16*16的区域
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
 
 	// Dynamically resize image-based auxiliary buffers during training
@@ -253,7 +250,8 @@ int CudaRasterizer::Rasterizer::forward(
 	}
 
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
-    // 光栅化之前，对每个高斯进行预处理
+    //! 1. 预处理和投影：将每个高斯投影到图像平面上、计算投影所占的tile块坐标和个数、根据球谐系数计算RGB值
+    // 具体实现在 forward.cu/preprocessCUDA
 	CHECK_CUDA(FORWARD::preprocess(
 		P, D, M,
 		means3D,
@@ -281,6 +279,7 @@ int CudaRasterizer::Rasterizer::forward(
 		prefiltered                       // 是否进行预过滤的标志
 	), debug)
 
+    //! 2. 高斯排序和合成顺序：根据高斯距离摄像机的远近来计算每个高斯在Alpha合成中的顺序
     // ---开始--- 通过视图变换 W 计算出像素与所有重叠高斯的距离，即这些高斯的深度，形成一个有序的高斯列表
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
@@ -331,7 +330,8 @@ int CudaRasterizer::Rasterizer::forward(
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
 
-    //! 核心渲染函数，定义在forward.h中，具体实现在 forward.cu/renderCUDA
+    //! 3. 渲染
+    // 具体实现在 forward.cu/renderCUDA
 	CHECK_CUDA(FORWARD::render(
 		tile_grid, block,
 		imgState.ranges,
