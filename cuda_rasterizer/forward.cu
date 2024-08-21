@@ -53,10 +53,14 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 	dir = dir / glm::length(dir);
 
 	glm::vec3* sh = ((glm::vec3*)shs) + idx * max_coeffs;   // 获取当前高斯的球谐系数(16, 3)
-	glm::vec3 result = SH_C0 * sh[0];                       // 计算0阶系数的颜色值
-	// SH_C1等是球谐函数的基函数
+
+    // 基函数(SH_C0、SH_C1等) * 系数(sh) = 最终的球谐函数
+
+    // 计算当前高斯的0阶系数的颜色值
+	glm::vec3 result = SH_C0 * sh[0];
+
 	if (deg > 0) {
-        // 阶数 > 0，则计算一阶SH系数的颜色值
+        // 阶数 > 0，则计算一阶系数的颜色值
 		float x = dir.x;
 		float y = dir.y;
 		float z = dir.z;
@@ -211,7 +215,7 @@ __global__ void preprocessCUDA(
     int P,  // 所有3D高斯的数量
     int D,  // 3D高斯的维度
     int M,  // 点云数量
-	const float* orig_points,   // 所有高斯 中心的世界坐标坐标
+	const float* orig_points,   // 所有高斯 中心的世界坐标
 	const glm::vec3* scales,    // 所有高斯的 缩放因子
 	const float scale_modifier, // 缩放因子的调整系数
 	const glm::vec4* rotations, // 所有高斯的 旋转四元数
@@ -322,7 +326,7 @@ __global__ void preprocessCUDA(
 }
 
 
-//! 光栅化最终的渲染步骤，渲染计算每个像素的颜色。
+//! 光栅化最终的渲染步骤，渲染计算每个像素的颜色
 // 在一个block上协作，每个线程负责一个像素，在获取数据 与 光栅化数据之间交替。在这个过程中，每个像素的颜色是通过考虑所有影响该像素的高斯来计算的。
 // (1) 通过计算当前线程所属的 tile 的范围，确定当前线程要处理的像素区域
 // (2) 判断当前线程是否在有效像素范围内，如果不在，则将 done 设置为 true，表示该线程不执行渲染操作
@@ -466,7 +470,7 @@ renderCUDA(
 	}
 }
 
-// 渲染的主函数
+//! 渲染的主函数
 void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
@@ -498,31 +502,32 @@ void FORWARD::render(
 }
 
 //! 光栅化之前，对每个高斯进行预处理
-void FORWARD::preprocess(int P, int D, int M,
-	const float* means3D,
-	const glm::vec3* scales,
-	const float scale_modifier,
-	const glm::vec4* rotations,
-	const float* opacities,
-	const float* shs,
-	bool* clamped,
-	const float* cov3D_precomp,
-	const float* colors_precomp,
-	const float* viewmatrix,
-	const float* projmatrix,
-	const glm::vec3* cam_pos,
-	const int W, int H,
-	const float focal_x, float focal_y,
-	const float tan_fovx, float tan_fovy,
-	int* radii,
-	float2* means2D,
-	float* depths,
-	float* cov3Ds,
-	float* rgb,
-	float4* conic_opacity,
-	const dim3 grid,
-	uint32_t* tiles_touched,
-	bool prefiltered)
+void FORWARD::preprocess(
+    int P, int D, int M,    // 所有高斯的个数，高斯的维度，点云数量
+	const float* means3D,   // 所有高斯 中心的世界坐标
+	const glm::vec3* scales,    // 所有高斯的 缩放因子
+	const float scale_modifier, // 缩放因子的调整系数
+	const glm::vec4* rotations, // 所有高斯的 旋转四元数
+	const float* opacities,     // 透明度
+	const float* shs,           // 所有高斯的 球谐系数
+	bool* clamped,              // 用于记录是否被裁剪的标志
+	const float* cov3D_precomp, // 预计算的3D协方差矩阵
+	const float* colors_precomp,    // 预计算的颜色
+	const float* viewmatrix,    // 观测变换矩阵
+	const float* projmatrix,    // 观测变换矩阵 * 投影变换矩阵
+	const glm::vec3* cam_pos,   // 相机位置
+	const int W, int H,         // 输出图像的宽、高
+	const float focal_x, float focal_y,     // 焦距
+	const float tan_fovx, float tan_fovy,   // tan(fov_x)和tan(fov_y)
+	int* radii,             // 输出的 所有高斯 在图像平面的最大投影半径 数组
+	float2* means2D,        // 输出的 所有高斯 中心在图像平面的坐标 数组
+	float* depths,          // 输出的 所有高斯 在相机坐标系下的深度 数组
+	float* cov3Ds,          // 输出的 所有高斯 在世界坐标系下的3D协方差矩阵 数组
+	float* rgb,             // 输出的 所有高斯 RGB颜色 数组
+	float4* conic_opacity,  // 输出的 所有高斯 2D协方差的逆 和 透明度 数组
+	const dim3 grid,        // CUDA网格的维度，grid.x 是网格在x方向上的块数，grid.y 是网格在y方向上的块数
+	uint32_t* tiles_touched,    // 输出的 所有高斯 覆盖的tile数量 数组
+	bool prefiltered)       // 是否进行预过滤的标志
 {
     // 调用CUDA核函数 preprocessCUDA 为每个高斯进行预处理，为后续的光栅化做好准备
     // CUDA核函数的执行由函数参数确定。在CUDA核函数中，每个线程块由多个线程组成，负责处理其中的一部分数据，从而加速高斯光栅化的计算

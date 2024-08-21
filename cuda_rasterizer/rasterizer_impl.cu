@@ -210,19 +210,19 @@ int CudaRasterizer::Rasterizer::forward(
 	const int P, int D, int M,
 	const float* background,
 	const int width, int height,
-	const float* means3D,
-	const float* shs,
-	const float* colors_precomp,
-	const float* opacities,
-	const float* scales,
-	const float scale_modifier,
-	const float* rotations,
-	const float* cov3D_precomp,
-	const float* viewmatrix,
-	const float* projmatrix,
-	const float* cam_pos,
+	const float* means3D,   // 所有高斯 中心的世界坐标
+	const float* shs,       // 所有高斯的 球谐系数
+	const float* colors_precomp,    // 预计算的颜色
+	const float* opacities, // 透明度
+	const float* scales,    // 所有高斯的 缩放因子
+	const float scale_modifier, // 缩放因子的调整系数
+	const float* rotations,     // 所有高斯的 旋转四元数
+	const float* cov3D_precomp, // 预计算的3D协方差矩阵
+	const float* viewmatrix,    // 观测变换矩阵
+	const float* projmatrix,    // 观测变换矩阵 * 投影变换矩阵
+	const float* cam_pos,       // 相机位置
 	const float tan_fovx, float tan_fovy,
-	const bool prefiltered,
+	const bool prefiltered,     // 是否进行预过滤的标志
 	float* out_color,
 	int* radii,
 	bool debug)
@@ -262,7 +262,7 @@ int CudaRasterizer::Rasterizer::forward(
 		(glm::vec4*)rotations,
 		opacities,
 		shs,
-		geomState.clamped,
+		geomState.clamped,      // 用于记录是否被裁剪的标志
 		cov3D_precomp,
 		colors_precomp,
 		viewmatrix, projmatrix,
@@ -270,15 +270,15 @@ int CudaRasterizer::Rasterizer::forward(
 		width, height,
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
-		radii,
-		geomState.means2D,
-		geomState.depths,
-		geomState.cov3D,
-		geomState.rgb,
-		geomState.conic_opacity,
-		tile_grid,
-		geomState.tiles_touched,
-		prefiltered
+		radii,      // 输出的 所有高斯 在图像平面的最大投影半径 数组
+		geomState.means2D,   // 输出的 所有高斯 中心在图像平面的坐标 数组
+		geomState.depths,                  // 输出的 所有高斯 在相机坐标系下的深度 数组
+		geomState.cov3D,           // 输出的 所有高斯 在世界坐标系下的3D协方差矩阵 数组
+		geomState.rgb,              // 输出的 所有高斯 RGB颜色 数组
+		geomState.conic_opacity,          // 输出的 所有高斯 2D协方差的逆 和 透明度 数组
+		tile_grid,                   // CUDA网格的维度，grid.x 是网格在x方向上的块数，grid.y 是网格在y方向上的块数
+		geomState.tiles_touched,          // 输出的 所有高斯 覆盖的tile数量 数组
+		prefiltered                       // 是否进行预过滤的标志
 	), debug)
 
     // ---开始--- 通过视图变换 W 计算出像素与所有重叠高斯的距离，即这些高斯的深度，形成一个有序的高斯列表

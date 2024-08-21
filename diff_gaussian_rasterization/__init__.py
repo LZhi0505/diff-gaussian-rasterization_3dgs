@@ -184,11 +184,11 @@ class GaussianRasterizationSettings(NamedTuple):
     tanfovy : float
     bg : torch.Tensor
     scale_modifier : float
-    viewmatrix : torch.Tensor
-    projmatrix : torch.Tensor
-    sh_degree : int
-    campos : torch.Tensor
-    prefiltered : bool
+    viewmatrix : torch.Tensor   # 观测变换矩阵，W2C
+    projmatrix : torch.Tensor   # 观测变换*投影变换矩阵，W2NDC = W2C * C2NDC
+    sh_degree : int         # 当前的球谐阶数
+    campos : torch.Tensor   # 当前相机中心的世界坐标
+    prefiltered : bool      # 预滤除的标志，默认为False
     debug : bool
 
 # 光栅器类，继承自nn.Module类，用于光栅化3D高斯
@@ -215,14 +215,14 @@ class GaussianRasterizer(nn.Module):
     def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
         """
         前向传播，进行3D高斯光栅化
-            means3D: 3D坐标
-            means2D: 2D坐标
-            opacities:   透明度
-            shs:         SH特征
-            colors_precomp:  预计算的颜色
-            scales:      缩放因子
-            rotations:   旋转
-            cov3D_precomp:   预计算的3D协方差矩阵
+            means3D: 所有高斯中心的 世界坐标
+            means2D: 输出的 所有高斯中心投影在图像平面的坐标
+            opacities:   所有高斯的不透明度
+            shs:         所有高斯的 球谐系数
+            colors_precomp:  预计算的颜色，默认为None，表明在光栅化预处理阶段计算
+            scales:      所有高斯的 缩放因子
+            rotations:   所有高斯的 旋转四元数
+            cov3D_precomp:   预计算的3D协方差矩阵，默认为None，表明在光栅化预处理阶段计算
         """
         raster_settings = self.raster_settings
 

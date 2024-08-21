@@ -15,19 +15,30 @@
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
-// Backward pass for conversion of spherical harmonics to RGB for
-// each Gaussian.
+
+/**
+ * 对每个3D高斯，将球谐函数转换为RGB的反向传播
+ * @param idx   当前3D高斯的索引
+ * @param deg   指定的3D高斯球谐函数的阶数
+ * @param max_coeffs    球谐函数的系数个数
+ * @param means         每个3D高斯 中心的坐标
+ * @param campos        相机位置
+ * @param shs           每个3D高斯的 球谐系数
+ * @param clamped       每个3D高斯是否需要进行截断
+ * @param dL_dcolor     目标颜色对 RGB颜色空间 的导数
+ * @param dL_dmeans     目标颜色对 3D高斯中心 的导数
+ * @param dL_dshs       目标颜色对 球谐函数系数 的导数
+ */
 __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_dshs)
 {
-	// Compute intermediate values, as it is done during forward
+    // 计算 相机到3D高斯中心 的单位向量
 	glm::vec3 pos = means[idx];
 	glm::vec3 dir_orig = pos - campos;
 	glm::vec3 dir = dir_orig / glm::length(dir_orig);
 
 	glm::vec3* sh = ((glm::vec3*)shs) + idx * max_coeffs;
 
-	// Use PyTorch rule for clamping: if clamping was applied,
-	// gradient becomes 0.
+	// 使用PyTorch rule进行截断：如果clamped为True，表示需要截断，则其梯度置为0
 	glm::vec3 dL_dRGB = dL_dcolor[idx];
 	dL_dRGB.x *= clamped[3 * idx + 0] ? 0 : 1;
 	dL_dRGB.y *= clamped[3 * idx + 1] ? 0 : 1;
