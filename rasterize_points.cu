@@ -25,78 +25,91 @@
 #include <functional>
 
 /**
- * rasterize_points.cu及.h文件定义了 RasterizeGaussiansCUDA、RasterizeGaussiansBackwardCUDA、markVisible 三个C函数，进行一些变量的初始化
  * RasterizeGaussiansCUDA、RasterizeGaussiansBackwardCUDA 分别使用CudaRasterizer::Rasterizer类的 forward、backward函数。
  * Rasterizer类在cuda_rasterizer文件夹下的 rasterizer.h、rasterizer_impl.h、rasterizer_impl.cu中定义
  */
 
-std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
+// 返回一个能动态调整内存缓冲区大小的函数指针
+std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) { //输入的张量为 要动态管理的内存缓冲区
     auto lambda = [&t](size_t N) {
-        t.resize_({(long long)N});
-		return reinterpret_cast<char*>(t.contiguous().data_ptr());
+        t.resize_({(long long)N});  // 调整t的大小为N
+		return reinterpret_cast<char*>(t.contiguous().data_ptr());  // 返回一个指向张量t起始位置的char*指针
     };
     return lambda;
 }
 
+/**
+ * 光栅化（前向传播）
+ * @return: 一个元组，包含
+ */
 std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
-	const torch::Tensor& background,
-	const torch::Tensor& means3D,
-    const torch::Tensor& colors,
-    const torch::Tensor& opacity,
-	const torch::Tensor& scales,
-	const torch::Tensor& rotations,
-	const float scale_modifier,
-	const torch::Tensor& cov3D_precomp,
-	const torch::Tensor& viewmatrix,
-	const torch::Tensor& projmatrix,
+	const torch::Tensor& background,    // 背景颜色，默认为[1,1,1]，黑色
+	const torch::Tensor& means3D,   // 所有高斯 中心的世界坐标
+    const torch::Tensor& colors,    // 预计算的颜色，默认是空tensor，后续在光栅化预处理阶段计算
+    const torch::Tensor& opacity,   // 所有高斯的 不透明度
+	const torch::Tensor& scales,    // 所有高斯的 缩放因子
+	const torch::Tensor& rotations, // 所有高斯的 旋转四元数
+	const float scale_modifier,     // 缩放因子调节系数
+	const torch::Tensor& cov3D_precomp, // 预计算的3D协方差矩阵，默认为空tensor，后续在光栅化预处理阶段计算
+	const torch::Tensor& viewmatrix,    // 观测变换矩阵，W2C
+	const torch::Tensor& projmatrix,    // 观测变换*投影变换矩阵，W2NDC = W2C * C2NDC
 	const float tan_fovx, 
 	const float tan_fovy,
     const int image_height,
     const int image_width,
-	const torch::Tensor& sh,
-	const int degree,
-	const torch::Tensor& campos,
-	const bool prefiltered,
-	const bool debug)
+	const torch::Tensor& sh,    // 所有高斯的 球谐系数，(N,16,3)
+	const int degree,           // 当前的球谐阶数
+	const torch::Tensor& campos,    // 当前相机中心的世界坐标
+	const bool prefiltered,     // 预滤除的标志，默认为False
+	const bool debug)           // 默认为False
 {
+  // 1. 检查所有高斯中心世界坐标tensor的维度必须是(N,3)
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
     AT_ERROR("means3D must have dimensions (num_points, 3)");
   }
   
-  const int P = means3D.size(0);
-  const int H = image_height;
-  const int W = image_width;
+  const int P = means3D.size(0);    // 所有高斯的个数
+  const int H = image_height;       // 图像高度
+  const int W = image_width;        // 图像宽度
 
+  // 2. 根据张量means3D的数据类型，创建合适的数据类型选项，分别用于整数和浮点数
   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
 
+  // 3. 初始化输出张量 out_color (3,H,W) 和 radii (N,)
   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
-  
+
+  // 4. 创建用于管理内存分配的辅助函数。
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
   torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
   torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
   torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
+  // geomFunc、binningFunc、imgFunc 是三个函数指针，其指向的函数可以动态调整内存缓冲区的大小
   std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
   
-  int rendered = 0;
-  if(P != 0)
-  {
+  int rendered = 0; // 初始化渲染的高斯个数为0
+
+  if(P != 0) {
+
+      // 如果输入了所有高斯的球谐系数，则 M=每个高斯的球谐系数个数=16；否则 M=0
 	  int M = 0;
-	  if(sh.size(0) != 0)
-	  {
+	  if(sh.size(0) != 0) {
 		M = sh.size(1);
       }
 
+      //! 5. 实际可微光栅化的前向渲染，返回...
 	  rendered = CudaRasterizer::Rasterizer::forward(
-	    geomFunc,
+	    geomFunc,   // 调整内存缓冲区的函数指针
 		binningFunc,
 		imgFunc,
-	    P, degree, M,
+	    P,          // 所有高斯的个数
+        degree,  // 当前的球谐阶数
+        M,          // 每个高斯的球谐系数个数=16
 		background.contiguous().data<float>(),
 		W, H,
 		means3D.contiguous().data<float>(),
@@ -113,10 +126,11 @@ RasterizeGaussiansCUDA(
 		tan_fovx,
 		tan_fovy,
 		prefiltered,
-		out_color.contiguous().data<float>(),
-		radii.contiguous().data<int>(),
+		out_color.contiguous().data<float>(),   // 输出的 颜色，(3,H,W)
+		radii.contiguous().data<int>(),     // 输出的 在图像平面上的投影半径(N,)
 		debug);
   }
+
   return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer);
 }
 

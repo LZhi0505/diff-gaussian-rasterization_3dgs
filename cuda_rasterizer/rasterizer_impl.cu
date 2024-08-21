@@ -153,99 +153,110 @@ void CudaRasterizer::Rasterizer::markVisible(
 		present);
 }
 
+// CUDA内存状态类，用于在GPU内存中存储和管理不同类型的数据
+// (1) 存储与高斯几何相关的信息
 CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P)
 {
 	GeometryState geom;
-	obtain(chunk, geom.depths, P, 128);
-	obtain(chunk, geom.clamped, P * 3, 128);
-	obtain(chunk, geom.internal_radii, P, 128);
-	obtain(chunk, geom.means2D, P, 128);
-	obtain(chunk, geom.cov3D, P * 6, 128);
-	obtain(chunk, geom.conic_opacity, P, 128);
-	obtain(chunk, geom.rgb, P * 3, 128);
-	obtain(chunk, geom.tiles_touched, P, 128);
+	obtain(chunk, geom.depths, P, 128); // 所有高斯 在相机坐标系下的深度
+	obtain(chunk, geom.clamped, P * 3, 128);    // 所有高斯 是否被裁剪的标志
+	obtain(chunk, geom.internal_radii, P, 128); // 所有高斯 在图像平面上的投影半径
+	obtain(chunk, geom.means2D, P, 128);    // 输出的 所有高斯 中心投影到图像平面的坐标
+	obtain(chunk, geom.cov3D, P * 6, 128);  // 所有高斯的 3D协方差矩阵
+	obtain(chunk, geom.conic_opacity, P, 128);  // 所有高斯的 2D协方差的逆、透明度
+	obtain(chunk, geom.rgb, P * 3, 128);    // 所有高斯的 RGB 颜色
+	obtain(chunk, geom.tiles_touched, P, 128);  // 所有高斯 覆盖的 tile数量
+
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
-	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
-	obtain(chunk, geom.point_offsets, P, 128);
+
+    obtain(chunk, geom.scanning_space, geom.scan_size, 128);    // 所有高斯
+	obtain(chunk, geom.point_offsets, P, 128);  // 所有高斯
 	return geom;
 }
 
+// (2) 存储与图像渲染相关的信息
 CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, size_t N)
 {
 	ImageState img;
-	obtain(chunk, img.accum_alpha, N, 128);
-	obtain(chunk, img.n_contrib, N, 128);
-	obtain(chunk, img.ranges, N, 128);
+	obtain(chunk, img.accum_alpha, N, 128); // 每个像素的累积 alpha 值
+	obtain(chunk, img.n_contrib, N, 128);   // 每个像素的贡献高斯数量
+	obtain(chunk, img.ranges, N, 128);      // 每个 tile 所需的高斯范围
 	return img;
 }
 
+// (3) 存储与高斯排序相关的信息
 CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chunk, size_t P)
 {
 	BinningState binning;
-	obtain(chunk, binning.point_list, P, 128);
-	obtain(chunk, binning.point_list_unsorted, P, 128);
-	obtain(chunk, binning.point_list_keys, P, 128);
-	obtain(chunk, binning.point_list_keys_unsorted, P, 128);
-	cub::DeviceRadixSort::SortPairs(
+	obtain(chunk, binning.point_list, P, 128);  // 排序后的高斯分布索引列表
+	obtain(chunk, binning.point_list_unsorted, P, 128); // 未排序的高斯分布索引列表
+	obtain(chunk, binning.point_list_keys, P, 128);     // 排序后的 (tile, depth) 键列表
+	obtain(chunk, binning.point_list_keys_unsorted, P, 128);    // 未排序的 (tile, depth) 键列表
+
+    cub::DeviceRadixSort::SortPairs(
 		nullptr, binning.sorting_size,
 		binning.point_list_keys_unsorted, binning.point_list_keys,
 		binning.point_list_unsorted, binning.point_list, P);
-	obtain(chunk, binning.list_sorting_space, binning.sorting_size, 128);
+
+    // list_sorting_space 用于排序的临时空间
+    obtain(chunk, binning.list_sorting_space, binning.sorting_size, 128);
 	return binning;
 }
 
-// Forward rendering procedure for differentiable rasterization of Gaussians.
+
 /**
- * 高斯可微光栅化的前向渲染处理，该函数可当作 main 函数
+ * 高斯的可微光栅化的前向渲染处理，可当作 main 函数
  */
 int CudaRasterizer::Rasterizer::forward(
-	std::function<char* (size_t)> geometryBuffer,
+	std::function<char* (size_t)> geometryBuffer,   // 和下面三个都是调整内存缓冲区的函数指针
 	std::function<char* (size_t)> binningBuffer,
 	std::function<char* (size_t)> imageBuffer,
-	const int P, int D, int M,
-	const float* background,
-	const int width, int height,
+	const int P,    // 所有高斯的个数
+    int D,      // 当前的球谐阶数
+    int M,      // 每个高斯的球谐系数个数=16
+	const float* background,    // 背景颜色，默认为[1,1,1]，黑色
+	const int width, int height,    // 图像宽、高
 	const float* means3D,   // 所有高斯 中心的世界坐标
 	const float* shs,       // 所有高斯的 球谐系数
-	const float* colors_precomp,    // 预计算的颜色
-	const float* opacities, // 透明度
+	const float* colors_precomp,    // 预计算的颜色，默认是空tensor，后续在光栅化预处理阶段计算
+	const float* opacities, // 所有高斯的 不透明度
 	const float* scales,    // 所有高斯的 缩放因子
 	const float scale_modifier, // 缩放因子的调整系数
 	const float* rotations,     // 所有高斯的 旋转四元数
-	const float* cov3D_precomp, // 预计算的3D协方差矩阵
-	const float* viewmatrix,    // 观测变换矩阵
-	const float* projmatrix,    // 观测变换矩阵 * 投影变换矩阵
-	const float* cam_pos,       // 相机位置
+	const float* cov3D_precomp, // 预计算的3D协方差矩阵，默认为空tensor，后续在光栅化预处理阶段计算
+	const float* viewmatrix,    // 观测变换矩阵，W2C
+	const float* projmatrix,    // 观测变换矩阵 * 投影变换矩阵，W2NDC = W2C * C2NDC
+	const float* cam_pos,       // 当前相机中心的世界坐标
 	const float tan_fovx, float tan_fovy,
-	const bool prefiltered,     // 是否进行预过滤的标志
-	float* out_color,
-	int* radii,
-	bool debug)
+	const bool prefiltered,     // 预滤除的标志，默认为False
+	float* out_color,       // 输出的 颜色，(3,H,W)
+	int* radii,             // 输出的 在图像平面上的投影半径(N,)
+	bool debug)     // 默认为False
 {
+    // 1. 计算焦距
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
-	size_t chunk_size = required<GeometryState>(P);
-	char* chunkptr = geometryBuffer(chunk_size);
-	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+    // 2. 分配、初始化几何信息geomState（包含）
+	size_t chunk_size = required<GeometryState>(P);     // 根据高斯的数量 P，计算所需的几何状态缓冲区大小
+	char* chunkptr = geometryBuffer(chunk_size);    // 分配足够大的缓冲区，获取指向缓冲区的指针 chunkptr
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);    // 将 chunkptr 转换为 GeometryState 对象，用于存储高斯的几何信息
 
-	if (radii == nullptr)
-	{
+	if (radii == nullptr) {
 		radii = geomState.internal_radii;
 	}
 
-    // 计算网格的大小，即所需的线程块数量 tile_grid，包含W/16 * H/16个线程块，是个二维结构
+    // 3. 计算CUDA网格的大小，即所需的线程块数量 tile_grid，包含W/16 * H/16个线程块，是个二维结构
 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
-    // 定义一个线程块 block，是16*16的二维结构，处理图象中16*16的区域
+    // 定义每个线程块 block的大小，是16*16的二维结构，处理图像中16*16的区域
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
 
-	// Dynamically resize image-based auxiliary buffers during training
+	// 4. 在训练期间动态调整与图像相关的辅助缓冲区
 	size_t img_chunk_size = required<ImageState>(width * height);
 	char* img_chunkptr = imageBuffer(img_chunk_size);
 	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
 
-	if (NUM_CHANNELS != 3 && colors_precomp == nullptr)
-	{
+	if (NUM_CHANNELS != 3 && colors_precomp == nullptr) {
 		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
 	}
 
