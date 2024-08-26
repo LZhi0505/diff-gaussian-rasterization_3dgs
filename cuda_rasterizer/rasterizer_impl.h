@@ -18,12 +18,20 @@
 
 namespace CudaRasterizer
 {
+    /**
+     * 从一个动态分配的内存块中提取并初始化指定类型的数组指针
+     * @tparam T
+     * @param chunk 输入/输出参数,指向动态分配的内存块的起始地址。函数执行后，chunk会被更新为下一个可用的内存块地址
+     * @param ptr   输出参数,初始化为指向内存块中指定类型 T数组的指针
+     * @param count 要初始化的 T 类型元素的个数
+     * @param alignment 内存对齐的字节数，通常为 128字节
+     */
 	template <typename T>
 	static void obtain(char*& chunk, T*& ptr, std::size_t count, std::size_t alignment)
 	{
-		std::size_t offset = (reinterpret_cast<std::uintptr_t>(chunk) + alignment - 1) & ~(alignment - 1);
-		ptr = reinterpret_cast<T*>(offset);
-		chunk = reinterpret_cast<char*>(ptr + count);
+		std::size_t offset = (reinterpret_cast<std::uintptr_t>(chunk) + alignment - 1) & ~(alignment - 1);  // 计算以 alignment=128字节对齐的 下一个对齐边界的地址
+		ptr = reinterpret_cast<T*>(offset);     // 将对齐后的地址强制转换为目标类型 T*,赋给 ptr 指针
+		chunk = reinterpret_cast<char*>(ptr + count);   // 将 chunk 指针向前移动,使其指向下一个可用的内存块起始位置
 	}
 
 	struct GeometryState

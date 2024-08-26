@@ -40,7 +40,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) { //输入的�
 
 /**
  * 光栅化（前向传播）
- * @return: 一个元组，包含
+ * @return: 一个元组，包含：渲染的高斯的个数 rendered、渲染的RGB图像 out_color、每个高斯在当前图像平面上的投影半径 radii、用于管理内存缓冲区的三个Tensor：geomBuffer、binningBuffer、imgBuffer
  */
 std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
@@ -64,7 +64,7 @@ RasterizeGaussiansCUDA(
 	const bool prefiltered,     // 预滤除的标志，默认为False
 	const bool debug)           // 默认为False
 {
-  // 1. 检查所有高斯中心世界坐标tensor的维度必须是(N,3)
+  // 1. 检查所有高斯中心世界坐标 tensor的维度必须是(N,3)
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
     AT_ERROR("means3D must have dimensions (num_points, 3)");
   }
@@ -73,15 +73,15 @@ RasterizeGaussiansCUDA(
   const int H = image_height;       // 图像高度
   const int W = image_width;        // 图像宽度
 
-  // 2. 根据张量means3D的数据类型，创建合适的数据类型选项，分别用于整数和浮点数
+  // 2. 根据张量 means3D的数据类型，创建 int32 和 float32数据类型，分别用于整数和浮点数
   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
 
-  // 3. 初始化输出张量 out_color (3,H,W) 和 radii (N,)
+  // 3. 初始化输出Tensor：渲染的RGB图像 out_color (3,H,W) 和 每个高斯在当前图像平面上的投影半径 radii (N,) 为全 0 Tensor
   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
 
-  // 4. 创建用于管理内存分配的辅助函数。
+  // 4. 创建用于管理内存分配的辅助函数
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
   torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
@@ -95,39 +95,40 @@ RasterizeGaussiansCUDA(
   int rendered = 0; // 初始化渲染的高斯个数为0
 
   if(P != 0) {
+      // 场景中存在高斯，则进行光栅化
 
-      // 如果输入了所有高斯的球谐系数，则 M=每个高斯的球谐系数个数=16；否则 M=0
+      // 如果参数中输入了所有高斯的球谐系数，则 M=每个高斯的球谐系数个数=16；否则 M=0
 	  int M = 0;
 	  if(sh.size(0) != 0) {
 		M = sh.size(1);
       }
 
-      //! 5. 实际可微光栅化的前向渲染，返回...
+      //! 5. 实际可微光栅化的前向渲染，返回：渲染的高斯的个数 rendered、渲染的RGB图像 out_color、每个高斯在当前图像平面上的投影半径 radii、用于管理内存缓冲区的三个Tensor：geomBuffer、binningBuffer、imgBuffer
 	  rendered = CudaRasterizer::Rasterizer::forward(
 	    geomFunc,   // 调整内存缓冲区的函数指针
 		binningFunc,
 		imgFunc,
 	    P,          // 所有高斯的个数
-        degree,  // 当前的球谐阶数
+        degree,     // 当前的球谐阶数
         M,          // 每个高斯的球谐系数个数=16
 		background.contiguous().data<float>(),
 		W, H,
-		means3D.contiguous().data<float>(),
-		sh.contiguous().data_ptr<float>(),
-		colors.contiguous().data<float>(), 
+		means3D.contiguous().data<float>(),     // PyTorch Tensor 默认使用 row-major内存布局，而一些计算库如 CUDA更喜欢 column-major布局，通过 contiguous()可以确保数据在内存中是连续的
+		sh.contiguous().data_ptr<float>(),      // CudaRasterizer::Rasterizer::forward需要C风格的原始指针作为输入，而不是Pytorch Tensor对象
+		colors.contiguous().data<float>(),      // data<float>() 方法会返回 Tensor中数据的原始指针，同时将数据类型转换为 float*
 		opacity.contiguous().data<float>(), 
 		scales.contiguous().data_ptr<float>(),
 		scale_modifier,
 		rotations.contiguous().data_ptr<float>(),
-		cov3D_precomp.contiguous().data<float>(), 
+		cov3D_precomp.contiguous().data<float>(),   // cov3D_precomp默认是空Tensor，则传入一个 NULL指针
 		viewmatrix.contiguous().data<float>(), 
 		projmatrix.contiguous().data<float>(),
 		campos.contiguous().data<float>(),
 		tan_fovx,
 		tan_fovy,
 		prefiltered,
-		out_color.contiguous().data<float>(),   // 输出的 颜色，(3,H,W)
-		radii.contiguous().data<int>(),     // 输出的 在图像平面上的投影半径(N,)
+		out_color.contiguous().data<float>(),   // 输出的 颜色图像，(3,H,W)
+		radii.contiguous().data<int>(),         // 输出的 在图像平面上的投影半径(N,)
 		debug);
   }
 

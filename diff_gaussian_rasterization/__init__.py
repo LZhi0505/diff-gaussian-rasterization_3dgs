@@ -231,7 +231,7 @@ class GaussianRasterizer(nn.Module):
         raster_settings = self.raster_settings
 
         if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
-            #  检查 球谐系数 和 预计算的颜色值 只能同时提供一种
+            # 检查 球谐系数 和 预计算的颜色值 只能同时提供一种
             raise Exception('Please provide excatly one of either SHs or precomputed colors!')
 
         if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):

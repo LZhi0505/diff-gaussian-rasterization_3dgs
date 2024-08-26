@@ -154,23 +154,24 @@ void CudaRasterizer::Rasterizer::markVisible(
 }
 
 // CUDA内存状态类，用于在GPU内存中存储和管理不同类型的数据
-// (1) 存储与高斯几何相关的信息
+// (1) 存储与高斯几何相关的信息，从动态分配的内存块(char*& chunk)中提取并初始化各种与高斯几何相关的数据成员
+// 在提取这些数据成员时，会使用 obtain函数来从动态分配的内存块中获取相应的数据,并确保数据的对齐方式为 128字节
 CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P)
 {
 	GeometryState geom;
-	obtain(chunk, geom.depths, P, 128); // 所有高斯 在相机坐标系下的深度
+	obtain(chunk, geom.depths, P, 128);         // 所有高斯 在相机坐标系下的深度
 	obtain(chunk, geom.clamped, P * 3, 128);    // 所有高斯 是否被裁剪的标志
 	obtain(chunk, geom.internal_radii, P, 128); // 所有高斯 在图像平面上的投影半径
 	obtain(chunk, geom.means2D, P, 128);    // 输出的 所有高斯 中心投影到图像平面的坐标
-	obtain(chunk, geom.cov3D, P * 6, 128);  // 所有高斯的 3D协方差矩阵
-	obtain(chunk, geom.conic_opacity, P, 128);  // 所有高斯的 2D协方差的逆、透明度
-	obtain(chunk, geom.rgb, P * 3, 128);    // 所有高斯的 RGB 颜色
+	obtain(chunk, geom.cov3D, P * 6, 128);  // 所有高斯 在世界坐标系下的3D协方差矩阵
+	obtain(chunk, geom.conic_opacity, P, 128);  // 所有高斯的 2D协方差的逆、不透明度
+	obtain(chunk, geom.rgb, P * 3, 128);    // 所有高斯的 RGB颜色
 	obtain(chunk, geom.tiles_touched, P, 128);  // 所有高斯 覆盖的 tile数量
 
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
 
-    obtain(chunk, geom.scanning_space, geom.scan_size, 128);    // 所有高斯
-	obtain(chunk, geom.point_offsets, P, 128);  // 所有高斯
+    obtain(chunk, geom.scanning_space, geom.scan_size, 128);    // 用于计算前缀和的中间缓冲区
+	obtain(chunk, geom.point_offsets, P, 128);  // 每个高斯在有序列表中的位置
 	return geom;
 }
 
@@ -178,7 +179,7 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, size_t N)
 {
 	ImageState img;
-	obtain(chunk, img.accum_alpha, N, 128); // 每个像素的累积 alpha 值
+	obtain(chunk, img.accum_alpha, N, 128); // 每个像素的累积 alpha值
 	obtain(chunk, img.n_contrib, N, 128);   // 每个像素的贡献高斯数量
 	obtain(chunk, img.ranges, N, 128);      // 每个 tile 所需的高斯范围
 	return img;
@@ -208,7 +209,7 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
  * 高斯的可微光栅化的前向渲染处理，可当作 main 函数
  */
 int CudaRasterizer::Rasterizer::forward(
-	std::function<char* (size_t)> geometryBuffer,   // 和下面三个都是调整内存缓冲区的函数指针
+	std::function<char* (size_t)> geometryBuffer,   // 三个都是调整内存缓冲区的函数指针
 	std::function<char* (size_t)> binningBuffer,
 	std::function<char* (size_t)> imageBuffer,
 	const int P,    // 所有高斯的个数
@@ -218,31 +219,32 @@ int CudaRasterizer::Rasterizer::forward(
 	const int width, int height,    // 图像宽、高
 	const float* means3D,   // 所有高斯 中心的世界坐标
 	const float* shs,       // 所有高斯的 球谐系数
-	const float* colors_precomp,    // 预计算的颜色，默认是空tensor，后续在光栅化预处理阶段计算
+	const float* colors_precomp,    // 因预计算的颜色默认是空tensor，则其传入的是一个 NULL指针
 	const float* opacities, // 所有高斯的 不透明度
 	const float* scales,    // 所有高斯的 缩放因子
 	const float scale_modifier, // 缩放因子的调整系数
 	const float* rotations,     // 所有高斯的 旋转四元数
-	const float* cov3D_precomp, // 预计算的3D协方差矩阵，默认为空tensor，后续在光栅化预处理阶段计算
+	const float* cov3D_precomp, // 因预计算的3D协方差矩阵默认是空tensor，则其传入的是一个 NULL指针
 	const float* viewmatrix,    // 观测变换矩阵，W2C
 	const float* projmatrix,    // 观测变换矩阵 * 投影变换矩阵，W2NDC = W2C * C2NDC
 	const float* cam_pos,       // 当前相机中心的世界坐标
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,     // 预滤除的标志，默认为False
-	float* out_color,       // 输出的 颜色，(3,H,W)
+	float* out_color,       // 输出的 颜色图像，(3,H,W)
 	int* radii,             // 输出的 在图像平面上的投影半径(N,)
 	bool debug)     // 默认为False
 {
-    // 1. 计算焦距
+    // 1. 计算焦距，W = 2fx * tan(Fovx/2) ==>
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
     // 2. 分配、初始化几何信息geomState（包含）
 	size_t chunk_size = required<GeometryState>(P);     // 根据高斯的数量 P，计算所需的几何状态缓冲区大小
-	char* chunkptr = geometryBuffer(chunk_size);    // 分配足够大的缓冲区，获取指向缓冲区的指针 chunkptr
-	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);    // 将 chunkptr 转换为 GeometryState 对象，用于存储高斯的几何信息
+	char* chunkptr = geometryBuffer(chunk_size);        // 分配指定大小 chunk_size的缓冲区，返回指向该缓冲区的指针 chunkptr
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);    // 将 chunkptr转换为 GeometryState对象，用于存储高斯的几何信息
 
 	if (radii == nullptr) {
+        // 如果传入的、要输出的 高斯在图像平面的投影半径为 nullptr，则将其设为
 		radii = geomState.internal_radii;
 	}
 
@@ -261,8 +263,7 @@ int CudaRasterizer::Rasterizer::forward(
 	}
 
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
-    //! 1. 预处理和投影：将每个高斯投影到图像平面上、计算投影所占的tile块坐标和个数、根据球谐系数计算RGB值
-    // 具体实现在 forward.cu/preprocessCUDA
+    //! 1. 预处理和投影：将每个高斯投影到图像平面上、计算投影所占的tile块坐标和个数、根据球谐系数计算RGB值。 具体实现在 forward.cu/preprocessCUDA
 	CHECK_CUDA(FORWARD::preprocess(
 		P, D, M,
 		means3D,
@@ -271,23 +272,23 @@ int CudaRasterizer::Rasterizer::forward(
 		(glm::vec4*)rotations,
 		opacities,
 		shs,
-		geomState.clamped,      // 用于记录是否被裁剪的标志
-		cov3D_precomp,
-		colors_precomp,
+		geomState.clamped,      // geomState中记录高斯是否被裁剪的标志
+		cov3D_precomp,          // 因预计算的3D协方差矩阵默认是空tensor，则传入的是一个 NULL指针
+		colors_precomp,         // 因预计算的颜色默认是空tensor，则传入的是一个 NULL指针
 		viewmatrix, projmatrix,
 		(glm::vec3*)cam_pos,
 		width, height,
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
-		radii,      // 输出的 所有高斯 在图像平面的最大投影半径 数组
-		geomState.means2D,   // 输出的 所有高斯 中心在图像平面的坐标 数组
-		geomState.depths,                  // 输出的 所有高斯 在相机坐标系下的深度 数组
-		geomState.cov3D,           // 输出的 所有高斯 在世界坐标系下的3D协方差矩阵 数组
-		geomState.rgb,              // 输出的 所有高斯 RGB颜色 数组
-		geomState.conic_opacity,          // 输出的 所有高斯 2D协方差的逆 和 透明度 数组
-		tile_grid,                   // CUDA网格的维度，grid.x 是网格在x方向上的块数，grid.y 是网格在y方向上的块数
-		geomState.tiles_touched,          // 输出的 所有高斯 覆盖的tile数量 数组
-		prefiltered                       // 是否进行预过滤的标志
+		radii,              // 输出的 所有高斯 在图像平面的最大投影半径 数组
+		geomState.means2D,  // 输出的 所有高斯 中心在图像平面的坐标 数组
+		geomState.depths,   // 输出的 所有高斯 在相机坐标系下的深度 数组
+		geomState.cov3D,    // 输出的 所有高斯 在世界坐标系下的3D协方差矩阵 数组
+		geomState.rgb,      // 输出的 所有高斯 RGB颜色 数组
+		geomState.conic_opacity,    // 输出的 所有高斯 2D协方差的逆 和 不透明度 数组
+		tile_grid,                  // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
+		geomState.tiles_touched,    // 输出的 所有高斯 覆盖的tile数量 数组
+		prefiltered                 // 预滤除的标志，默认为False
 	), debug)
 
     //! 2. 高斯排序和合成顺序：根据高斯距离摄像机的远近来计算每个高斯在Alpha合成中的顺序

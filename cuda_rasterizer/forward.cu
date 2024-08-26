@@ -204,33 +204,33 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 // 计算圆圈覆盖的像素数：这涉及到将图像平面分成许多小块（tiles），并计算每个高斯分布投影形成的圆圈与哪些小块相交。这是为了高效地渲染，只更新受影响的小块。
 template<int C>
 __global__ void preprocessCUDA(
-    int P,  // 所有3D高斯的数量
-    int D,  // 3D高斯的维度
-    int M,  // 点云数量
+    int P,  // 所有高斯的个数
+    int D,  // 当前的球谐阶数
+    int M,  // 每个高斯的球谐系数个数=16
 	const float* orig_points,   // 所有高斯 中心的世界坐标
 	const glm::vec3* scales,    // 所有高斯的 缩放因子
 	const float scale_modifier, // 缩放因子的调整系数
 	const glm::vec4* rotations, // 所有高斯的 旋转四元数
-	const float* opacities,     // 透明度
+	const float* opacities,     // 所有高斯的 不透明度
 	const float* shs,           // 所有高斯的 球谐系数
-	bool* clamped,              // 用于记录是否被裁剪的标志
-	const float* cov3D_precomp, // 预计算的3D协方差矩阵
-	const float* colors_precomp,    // 预计算的颜色
-	const float* viewmatrix,    // 观测变换矩阵
-	const float* projmatrix,    // 观测变换矩阵 * 投影变换矩阵
-	const glm::vec3* cam_pos,   // 相机位置
+	bool* clamped,              // geomState中记录高斯是否被裁剪的标志
+	const float* cov3D_precomp, // 因预计算的3D协方差矩阵默认是空tensor，则传入的是一个 NULL指针
+	const float* colors_precomp,    // 因预计算的颜色默认是空tensor，则传入的是一个 NULL指针
+	const float* viewmatrix,    // 观测变换矩阵，W2C
+	const float* projmatrix,    // 观测变换矩阵 * 投影变换矩阵，W2NDC = W2C * C2NDC
+	const glm::vec3* cam_pos,   // 当前相机中心的世界坐标
 	const int W, int H,         // 输出图像的宽、高
-	const float tan_fovx, float tan_fovy,   // tan(fov_x)和tan(fov_y)
-	const float focal_x, float focal_y,     // 焦距
+	const float tan_fovx, float tan_fovy,
+	const float focal_x, float focal_y,
 	int* radii,                 // 输出的 所有高斯 在图像平面的最大投影半径 数组
 	float2* points_xy_image,    // 输出的 所有高斯 中心在图像平面的坐标 数组
 	float* depths,              // 输出的 所有高斯 在相机坐标系下的深度 数组
 	float* cov3Ds,              // 输出的 所有高斯 在世界坐标系下的3D协方差矩阵 数组
 	float* rgb,                 // 输出的 所有高斯 RGB颜色 数组
-	float4* conic_opacity,      // 输出的 所有高斯 2D协方差的逆 和 透明度 数组
-	const dim3 grid,            // CUDA网格的维度，grid.x 是网格在x方向上的块数，grid.y 是网格在y方向上的块数
+	float4* conic_opacity,      // 输出的 所有高斯 2D协方差的逆 和 不透明度 数组
+	const dim3 grid,            // CUDA网格的维度，CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
 	uint32_t* tiles_touched,    // 输出的 所有高斯 覆盖的tile数量 数组
-	bool prefiltered)           // 是否进行预过滤的标志
+	bool prefiltered)           // 预滤除的标志，默认为False
 {
     // 1. 获取当前线程在CUDA grid中的全局索引，即当前线程处理的高斯的索引
 	auto idx = cg::this_grid().thread_rank();
@@ -499,31 +499,33 @@ void FORWARD::render(
  * (2) 计算投影椭圆涉及到的tile的坐标和个数，以高效渲染
  */
 void FORWARD::preprocess(
-    int P, int D, int M,    // 所有高斯的个数，高斯的维度，点云数量
+    int P,      // 所有高斯的个数
+    int D,      // 当前的球谐阶数
+    int M,      // 每个高斯的球谐系数个数=16
 	const float* means3D,   // 所有高斯 中心的世界坐标
 	const glm::vec3* scales,    // 所有高斯的 缩放因子
 	const float scale_modifier, // 缩放因子的调整系数
 	const glm::vec4* rotations, // 所有高斯的 旋转四元数
-	const float* opacities,     // 透明度
+	const float* opacities,     // 所有高斯的 不透明度
 	const float* shs,           // 所有高斯的 球谐系数
-	bool* clamped,              // 用于记录是否被裁剪的标志
-	const float* cov3D_precomp, // 预计算的3D协方差矩阵
-	const float* colors_precomp,    // 预计算的颜色
-	const float* viewmatrix,    // 观测变换矩阵
-	const float* projmatrix,    // 观测变换矩阵 * 投影变换矩阵
-	const glm::vec3* cam_pos,   // 相机位置
-	const int W, int H,         // 输出图像的宽、高
-	const float focal_x, float focal_y,     // 焦距
-	const float tan_fovx, float tan_fovy,   // tan(fov_x)和tan(fov_y)
+	bool* clamped,              // geomState中记录高斯是否被裁剪的标志
+	const float* cov3D_precomp, // 因预计算的3D协方差矩阵默认是空tensor，则传入的是一个 NULL指针
+	const float* colors_precomp,    // 因预计算的颜色默认是空tensor，则传入的是一个 NULL指针
+	const float* viewmatrix,    // 观测变换矩阵，W2C
+	const float* projmatrix,    // 观测变换矩阵 * 投影变换矩阵，W2NDC = W2C * C2NDC
+	const glm::vec3* cam_pos,   // 当前相机中心的世界坐标
+	const int W, int H,
+	const float focal_x, float focal_y,
+	const float tan_fovx, float tan_fovy,   // tan(fov_x/2)和tan(fov_y/2)
 	int* radii,             // 输出的 所有高斯 在图像平面的最大投影半径 数组
 	float2* means2D,        // 输出的 所有高斯 中心在图像平面的坐标 数组
 	float* depths,          // 输出的 所有高斯 在相机坐标系下的深度 数组
 	float* cov3Ds,          // 输出的 所有高斯 在世界坐标系下的3D协方差矩阵 数组
 	float* rgb,             // 输出的 所有高斯 RGB颜色 数组
-	float4* conic_opacity,  // 输出的 所有高斯 2D协方差的逆 和 透明度 数组
-	const dim3 grid,        // CUDA网格的维度，grid.x 是网格在x方向上的块数，grid.y 是网格在y方向上的块数
+	float4* conic_opacity,  // 输出的 所有高斯 2D协方差的逆 和 不透明度 数组
+	const dim3 grid,        // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
 	uint32_t* tiles_touched,    // 输出的 所有高斯 覆盖的tile数量 数组
-	bool prefiltered)       // 是否进行预过滤的标志
+	bool prefiltered)       // 预滤除的标志，默认为False
 {
     /**
      * 核函数使用__global__修饰符声明。这表明该函数是一个核函数（只能在 GPU上执行，不能在 CPU上执行）
