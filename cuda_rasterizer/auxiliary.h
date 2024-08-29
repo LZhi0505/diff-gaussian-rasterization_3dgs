@@ -46,11 +46,11 @@ __device__ const float SH_C3[] = {
  */
 __forceinline__ __device__ float ndc2Pix(float v, int S)
 {
-	return ((v + 1.0) * S - 1.0) * 0.5;
+	return ((v + 1.0) * S - 1.0) * 0.5; // 即 (v + 1) / 2 * S - 1/2 的坐标范围变化：(-1,1) ==> (0,1) ==> (0, s) ==> (-1/2,s/2)
 }
 
 /**
- * 计算该高斯在图像平面的影响范围（左上角和右下角坐标）对应在CUDA块级别的最小和最大边界
+ * 计算该高斯在图像平面的影响范围（左上角和右下角坐标）对应在CUDA线程块级别的最小和最大边界
  * p:           该高斯中心在图像平面的二维坐标
  * max_radius:  该高斯在图像平面的最大投影半径
  * rect_min:    输出的 最小矩形的左上角坐标（块级别）
@@ -59,8 +59,8 @@ __forceinline__ __device__ float ndc2Pix(float v, int S)
  */
 __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& rect_min, uint2& rect_max, dim3 grid)
 {
-    // BLOCK_X 和 BLOCK_Y 表示CUDA中每个块在图像中的宽度和高度（即每个块包含的像素数量）
-    // 左上角（0 < 该高斯投影在x方向上的左边界 转换为 块坐标 < grid.x；0 < 该高斯投影在y方向上的上边界 转换为 块坐标 < grid.y）
+    // BLOCK_X 和 BLOCK_Y 表示CUDA中每个线程块所在x与y方向上包含的像素个数
+    // 左上角（0 < 该高斯投影在x方向上的左边界 转换为 线程块坐标 < grid.x；0 < 该高斯投影在y方向上的上边界 转换为 线程块坐标 < grid.y）
 	rect_min = {
 		min(grid.x, max((int)0, (int)((p.x - max_radius) / BLOCK_X))),
 		min(grid.y, max((int)0, (int)((p.y - max_radius) / BLOCK_Y)))
@@ -73,7 +73,7 @@ __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& r
 }
 
 /**
- * 将该高斯中心从 世界坐标系 变换到 相机坐标系，即 x = matrix * p
+ * 将该高斯中心从 世界坐标系 变换到 相机坐标系，即 x = matrix * p，(3,1)
  * p: 该3D高斯中心的世界坐标
  * matrix: 观测变换
  */
@@ -88,7 +88,7 @@ __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float
 }
 
 /**
- * 将该高斯中心从 世界坐标系 变换到 NDC坐标系，即 x = matrix * p
+ * 将该高斯中心从 世界坐标系 变换到 NDC坐标系，即 x = matrix * p，(4,1)
  * p: 该高斯中心的世界坐标
  * matrix: 观测变换 * 投影变换，(4,4)
  */
@@ -169,9 +169,9 @@ __forceinline__ __device__ float sigmoid(float x)
  */
 __forceinline__ __device__ bool in_frustum(int idx, // 该高斯的索引
 	const float* orig_points,   // 所有高斯 中心的世界坐标坐标
-	const float* viewmatrix,    // 观测变换矩阵
-	const float* projmatrix,    // 观测变换矩阵 * 投影变换矩阵
-	bool prefiltered,           // 是否进行预过滤的标志
+	const float* viewmatrix,    // 观测变换矩阵，W2C
+	const float* projmatrix,    // 观测变换矩阵 * 投影变换矩阵，W2NDC = W2C * C2NDC
+	bool prefiltered,           // 预滤除的标志，默认为False
 	float3& p_view)             // 输出的 该高斯在相机坐标系下的位置
 {
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };   // 该高斯中心的世界坐标

@@ -27,39 +27,38 @@ namespace cg = cooperative_groups;
 // Forward method for converting the input spherical harmonics
 // coefficients of each Gaussian to a simple RGB color.
 /**
- * 从一个3D高斯的球谐系数计算RGB颜色
- * @param idx 当前高斯的索引
- * @param deg 球谐函数的阶数
- * @param max_coeffs
- * @param means 所有高斯中心 的世界坐标
- * @param campos 相机中心的位置
- * @param shs   所有高斯的 球谐系数 (16, 3)
- * @param clamped   用于记录是否被裁剪的标志
- * @return
+ * 根据一个3D高斯的球谐系数，计算 当前相机中心 看向 该高斯中心 方向的RGB颜色值，(3,)
+ * @param idx   当前高斯的索引
+ * @param deg   当前的球谐阶数
+ * @param max_coeffs    每个高斯的球谐系数个数=16
+ * @param means 所有高斯 中心的世界坐标
+ * @param campos 当前相机中心的世界坐标
+ * @param shs    所有高斯的 球谐系数
+ * @param clamped   geomState中记录高斯是否被裁剪的标志，即某位置为 True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
  */
 __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, bool* clamped)
 {
 	// 该函数基于zhang等人的论文"Differentiable Point-Based Radiance Fields for Efficient View Synthesis"中的代码实现
 	glm::vec3 pos = means[idx];		// 当前高斯中心 的世界坐标
-	glm::vec3 dir = pos - campos;	// 从相机中心指向当前高斯的 单位向量
+	glm::vec3 dir = pos - campos;	// 从 相机中心 指向 当前高斯中心的 单位向量
 	dir = dir / glm::length(dir);
 
 	glm::vec3* sh = ((glm::vec3*)shs) + idx * max_coeffs;   // 获取当前高斯的球谐系数(16, 3)
 
     // 基函数(SH_C0、SH_C1等) * 系数(sh) = 最终的球谐函数
 
-    // 计算当前高斯的0阶系数的颜色值
+    // 计算当前高斯的0阶SH系数的颜色值，(3,)
 	glm::vec3 result = SH_C0 * sh[0];
 
 	if (deg > 0) {
-        // 阶数 > 0，则计算一阶系数的颜色值
+        // 当前的球谐阶数 > 0，则计算一阶SH系数的颜色值
 		float x = dir.x;
 		float y = dir.y;
 		float z = dir.z;
 		result = result - SH_C1 * y * sh[1] + SH_C1 * z * sh[2] - SH_C1 * x * sh[3];
 
 		if (deg > 1) {
-            // 阶数 > 1，则计算二阶SH系数的颜色值
+            // 当前的球谐阶数 > 1，则计算二阶SH系数的颜色值
 			float xx = x * x, yy = y * y, zz = z * z;
 			float xy = x * y, yz = y * z, xz = x * z;
 			result = result +
@@ -70,7 +69,7 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 				SH_C2[4] * (xx - yy) * sh[8];
 
 			if (deg > 2) {
-                // 阶数 > 2，则计算三阶SH系数的颜色值
+                // 当前的球谐阶数 > 2，则计算三阶SH系数的颜色值
 				result = result +
 					SH_C3[0] * y * (3.0f * xx - yy) * sh[9] +
 					SH_C3[1] * xy * z * sh[10] +
@@ -82,14 +81,14 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 			}
 		}
 	}
-    // 为结果颜色值加上一个偏移量
+    // 为结果颜色值加上一个偏移量，(3,)
 	result += 0.5f;
 
-    // 将RGB颜色值限制在正值范围内。如果被限制，则需要在反向传播过程中记录此信息。
+    // 将RGB颜色值限制在正值范围内。如果计算的 当前相机看该高斯的RGB颜色值 < 0，则在 geomState的 clamped中记录其RGB对应的值为True
 	clamped[3 * idx + 0] = (result.x < 0);
 	clamped[3 * idx + 1] = (result.y < 0);
 	clamped[3 * idx + 2] = (result.z < 0);
-	return glm::max(result, 0.0f);
+	return glm::max(result, 0.0f);  // 返回值>0的RGB值
 }
 
 // Forward version of 2D covariance matrix computation
@@ -100,16 +99,15 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
  * @param mean      该高斯中心 的世界坐标
  * @param focal_x   相机在焦x轴方向上的焦距，也是视锥体近平面的深度
  * @param focal_y
- * @param tan_fovx
+ * @param tan_fovx  tan(Fovx / 2)
  * @param tan_fovy
- * @param cov3D     该高斯的 3D协方差矩阵
- * @param viewmatrix 观测变换矩阵，即世界坐标系 ==> 相机坐标系
+ * @param cov3D     该高斯的 世界坐标系下的 3D协方差矩阵
+ * @param viewmatrix 观测变换矩阵，W2C
  * @return 像素坐标系下的协方差矩阵，维度为(2,2)，但只返回了上半角元素(3个)
  */
 __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y, float tan_fovx, float tan_fovy, const float* cov3D, const float* viewmatrix)
 {
-	// The following models the steps outlined by equations 29
-	// and 31 in "EWA Splatting" (Zwicker et al., 2002). 
+	// The following models the steps outlined by equations 29 and 31 in "EWA Splatting" (Zwicker et al., 2002).
 	// Additionally considers aspect / scaling of viewport.
 	// Transposes used to account for row-/column-major conventions.
 	// 雅克比矩阵在一个点附近才满足使用线性变换 近似 非线性变换的条件，而高斯的中心位置就是这个点，所以先求得3D高斯在相机坐标系下的位置）
@@ -207,13 +205,13 @@ __global__ void preprocessCUDA(
     int P,  // 所有高斯的个数
     int D,  // 当前的球谐阶数
     int M,  // 每个高斯的球谐系数个数=16
-	const float* orig_points,   // 所有高斯 中心的世界坐标
+	const float* orig_points,   // 所有高斯 中心的世界坐标 数组，(x0, y0, z0, ..., xn, yn, zn)
 	const glm::vec3* scales,    // 所有高斯的 缩放因子
 	const float scale_modifier, // 缩放因子的调整系数
 	const glm::vec4* rotations, // 所有高斯的 旋转四元数
 	const float* opacities,     // 所有高斯的 不透明度
 	const float* shs,           // 所有高斯的 球谐系数
-	bool* clamped,              // geomState中记录高斯是否被裁剪的标志
+	bool* clamped,              // geomState中记录高斯是否被裁剪的标志，即某位置为 True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
 	const float* cov3D_precomp, // 因预计算的3D协方差矩阵默认是空tensor，则传入的是一个 NULL指针
 	const float* colors_precomp,    // 因预计算的颜色默认是空tensor，则传入的是一个 NULL指针
 	const float* viewmatrix,    // 观测变换矩阵，W2C
@@ -222,14 +220,14 @@ __global__ void preprocessCUDA(
 	const int W, int H,         // 输出图像的宽、高
 	const float tan_fovx, float tan_fovy,
 	const float focal_x, float focal_y,
-	int* radii,                 // 输出的 所有高斯 在图像平面的最大投影半径 数组
-	float2* points_xy_image,    // 输出的 所有高斯 中心在图像平面的坐标 数组
-	float* depths,              // 输出的 所有高斯 在相机坐标系下的深度 数组
+	int* radii,                 // 输出的 所有高斯 投影在图像平面的最大半径 数组
+	float2* points_xy_image,    // 输出的 所有高斯 中心在图像平面的二维坐标 数组
+	float* depths,              // 输出的 所有高斯 中心在相机坐标系下的z值 数组
 	float* cov3Ds,              // 输出的 所有高斯 在世界坐标系下的3D协方差矩阵 数组
-	float* rgb,                 // 输出的 所有高斯 RGB颜色 数组
+	float* rgb,                 // 输出的 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	float4* conic_opacity,      // 输出的 所有高斯 2D协方差的逆 和 不透明度 数组
-	const dim3 grid,            // CUDA网格的维度，CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
-	uint32_t* tiles_touched,    // 输出的 所有高斯 覆盖的tile数量 数组
+	const dim3 grid,            // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
+	uint32_t* tiles_touched,    // 输出的 所有高斯 在图像平面覆盖的线程块 tile的个数 数组
 	bool prefiltered)           // 预滤除的标志，默认为False
 {
     // 1. 获取当前线程在CUDA grid中的全局索引，即当前线程处理的高斯的索引
@@ -237,7 +235,7 @@ __global__ void preprocessCUDA(
 	if (idx >= P)   // 一个线程只处理一个高斯，避免越界访问
 		return;
 
-    // 2. 初始化 半径、触及到的tile数量为0。只有实际被处理和影响图像的高斯才会改变这些值，如果这些值保持为0，说明该高斯不会影响最终渲染，不需要进一步处理
+    // 2. 初始化该高斯 在图像平面的最大投影半径、覆盖的tile数量为 0。如果这些值保持为0，说明该高斯不会影响最终渲染，不需要进一步处理
 	radii[idx] = 0;
 	tiles_touched[idx] = 0;
 
@@ -258,7 +256,7 @@ __global__ void preprocessCUDA(
 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
 
     // 4.2 将该高斯的 协方差矩阵 从3D变换到2D：包含观测变换(viewmatrix)、投影变换中的视锥到立方体的变换(雅可比矩阵)
-	// (1) 获取3D协方差矩阵
+	// (1) 获取世界坐标系下的 3D协方差矩阵
 	const float* cov3D;
 	if (cov3D_precomp != nullptr) {
 		// 如果提供了预计算的3D协方差矩阵，则直接使用它
@@ -269,7 +267,7 @@ __global__ void preprocessCUDA(
 		cov3D = cov3Ds + idx * 6;
 	}
     // (2) 变换该3D协方差矩阵：世界坐标系 ==观测变换==> 相机坐标系 ==投影变换中视锥到立方体==> 立方体中
-    // 2D协方差矩阵的上半角元素(3个)
+    // 2D协方差矩阵（只存了上半角元素，3个）
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
 
     // 5. 计算2D协方差矩阵的 逆，用于EWA滤波算法
@@ -278,21 +276,20 @@ __global__ void preprocessCUDA(
         // 行列式为0，该矩阵 不可逆，则直接返回
 		return;
 	float det_inv = 1.f / det;
+    // 2D协方差矩阵的逆矩阵（也只存了上半角元素，2x2的矩阵的取逆是 主对角线取反，次对角线取负，再除以行列式）
 	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };  // 取逆
 
-    // 6. 计算在屏幕空间中的扩展范围（通过计算2D协方差矩阵的特征值）
-    // 使用扩展范围计算与该高斯重叠的屏幕空间矩形的边界框。如果矩形覆盖0个tile，则退出
-	float mid = 0.5f * (cov.x + cov.z); // 2D协方差矩阵对角线元素的均值
-    // 2D协方差矩阵的特征值，代表椭圆的长轴和短轴
-	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
+    // 6. 计算该3D高斯投影在屏幕平面上的、扩展后的 投影圆所在的矩形框边界，最后再转换为 线程块的坐标。如果矩形覆盖0个tile，则退出
+    // (1) 计算该高斯 投影在图像平面的最大半径
+	float mid = 0.5f * (cov.x + cov.z); // 2D协方差矩阵主对角线元素的均值
+	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det)); // 2D协方差矩阵的特征值，即代表2D椭圆的长轴和短轴
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
-    // 该高斯在图像平面的最大投影半径
-	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
+	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));  // 投影在图像平面的最大半径
 
-    // 该高斯中心在图像平面的二维坐标（从 NDC平面 拉回到 图像平面）
+    // (2) 计算该高斯 中心在图像平面的二维坐标（从 NDC平面 拉回到 图像平面）
     float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
 
-    // 计算该高斯投影最大半径画的圆 在图像平面的影响范围（左上角和右下角坐标）对应在CUDA块（投影矩形）的边界
+    // (3) 计算该高斯投影最大半径画的圆 在图像平面的影响范围（左上角和右下角坐标）对应在CUDA线程块（投影矩形）的边界
 	uint2 rect_min, rect_max;
 	getRect(point_image, my_radius, rect_min, rect_max, grid);
 
@@ -300,9 +297,9 @@ __global__ void preprocessCUDA(
         // 投影矩形面积=0，说明该高斯不会影响任何屏幕像素，则直接返回
 		return;
 
-    // 7. 如果提供了预计算的颜色，则直接使用；否则将球谐系数转换为RGB颜色，存储在rgb数组中
+    // 7. 如果提供了预计算的颜色，则直接使用
 	if (colors_precomp == nullptr) {
-        // 默认，未预计算颜色
+        // 默认，未预计算颜色，则根据 该高斯的球谐系数 与 当前相机看该高斯的方向 计算该观测下的RGB颜色值，(3,)，同时如果某个RGB值<0，则在 clamped数组对应位置中置为 True
 		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
 		rgb[idx * C + 0] = result.x;
 		rgb[idx * C + 1] = result.y;
@@ -310,10 +307,10 @@ __global__ void preprocessCUDA(
 	}
 
     // 8. 存储计算的深度、半径、屏幕坐标等结果，用于下一步继续处理
-	depths[idx] = p_view.z; // 该高斯在相机坐标系下的深度
-	radii[idx] = my_radius; // 该高斯投影到屏幕空间的最大半径
-	points_xy_image[idx] = point_image; // 该高斯中心在像素平面的坐标
-	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };     // 该高斯的2D协方差的逆、透明度
+	depths[idx] = p_view.z; // 该高斯中心在相机坐标系下的z值
+	radii[idx] = my_radius; // 该高斯投影在图像平面的最大半径
+	points_xy_image[idx] = point_image; // 该高斯中心在图像平面的二维坐标
+	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };     // 该高斯的2D协方差的逆、不透明度
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x); // 该高斯投影最大半径画的圆 在屏幕空间覆盖的tile数量，用于渲染的优化
 }
 
@@ -502,13 +499,13 @@ void FORWARD::preprocess(
     int P,      // 所有高斯的个数
     int D,      // 当前的球谐阶数
     int M,      // 每个高斯的球谐系数个数=16
-	const float* means3D,   // 所有高斯 中心的世界坐标
+	const float* means3D,   // 所有高斯 中心的世界坐标 数组，(x0, y0, z0, ..., xn, yn, zn)
 	const glm::vec3* scales,    // 所有高斯的 缩放因子
 	const float scale_modifier, // 缩放因子的调整系数
 	const glm::vec4* rotations, // 所有高斯的 旋转四元数
 	const float* opacities,     // 所有高斯的 不透明度
 	const float* shs,           // 所有高斯的 球谐系数
-	bool* clamped,              // geomState中记录高斯是否被裁剪的标志
+	bool* clamped,              // geomState中记录高斯是否被裁剪的标志，即某位置为 True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
 	const float* cov3D_precomp, // 因预计算的3D协方差矩阵默认是空tensor，则传入的是一个 NULL指针
 	const float* colors_precomp,    // 因预计算的颜色默认是空tensor，则传入的是一个 NULL指针
 	const float* viewmatrix,    // 观测变换矩阵，W2C
@@ -517,14 +514,14 @@ void FORWARD::preprocess(
 	const int W, int H,
 	const float focal_x, float focal_y,
 	const float tan_fovx, float tan_fovy,   // tan(fov_x/2)和tan(fov_y/2)
-	int* radii,             // 输出的 所有高斯 在图像平面的最大投影半径 数组
-	float2* means2D,        // 输出的 所有高斯 中心在图像平面的坐标 数组
-	float* depths,          // 输出的 所有高斯 在相机坐标系下的深度 数组
+	int* radii,             // 输出的 所有高斯 投影在图像平面的最大半径 数组
+	float2* means2D,        // 输出的 所有高斯 中心在图像平面的二维坐标 数组
+	float* depths,          // 输出的 所有高斯 中心在相机坐标系下的z值 数组
 	float* cov3Ds,          // 输出的 所有高斯 在世界坐标系下的3D协方差矩阵 数组
-	float* rgb,             // 输出的 所有高斯 RGB颜色 数组
+	float* rgb,             // 输出的 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	float4* conic_opacity,  // 输出的 所有高斯 2D协方差的逆 和 不透明度 数组
 	const dim3 grid,        // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
-	uint32_t* tiles_touched,    // 输出的 所有高斯 覆盖的tile数量 数组
+	uint32_t* tiles_touched,    // 输出的 所有高斯 在图像平面覆盖的线程块 tile的个数 数组
 	bool prefiltered)       // 预滤除的标志，默认为False
 {
     /**

@@ -234,7 +234,7 @@ int CudaRasterizer::Rasterizer::forward(
 	int* radii,             // 输出的 在图像平面上的投影半径(N,)
 	bool debug)     // 默认为False
 {
-    // 1. 计算焦距，W = 2fx * tan(Fovx/2) ==>
+    // 1. 计算焦距，W = 2fx * tan(Fovx/2) ==> fx = W / (2 * tan(Fovx/2))
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
@@ -272,7 +272,7 @@ int CudaRasterizer::Rasterizer::forward(
 		(glm::vec4*)rotations,
 		opacities,
 		shs,
-		geomState.clamped,      // geomState中记录高斯是否被裁剪的标志
+		geomState.clamped,      // geomState中记录高斯是否被裁剪的标志，即某位置为 True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
 		cov3D_precomp,          // 因预计算的3D协方差矩阵默认是空tensor，则传入的是一个 NULL指针
 		colors_precomp,         // 因预计算的颜色默认是空tensor，则传入的是一个 NULL指针
 		viewmatrix, projmatrix,
@@ -280,14 +280,14 @@ int CudaRasterizer::Rasterizer::forward(
 		width, height,
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
-		radii,              // 输出的 所有高斯 在图像平面的最大投影半径 数组
-		geomState.means2D,  // 输出的 所有高斯 中心在图像平面的坐标 数组
-		geomState.depths,   // 输出的 所有高斯 在相机坐标系下的深度 数组
+		radii,              // 输出的 所有高斯 投影在图像平面的最大半径 数组
+		geomState.means2D,  // 输出的 所有高斯 中心在图像平面的二维坐标 数组
+		geomState.depths,   // 输出的 所有高斯 中心在相机坐标系下的z值 数组
 		geomState.cov3D,    // 输出的 所有高斯 在世界坐标系下的3D协方差矩阵 数组
-		geomState.rgb,      // 输出的 所有高斯 RGB颜色 数组
+		geomState.rgb,      // 输出的 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 		geomState.conic_opacity,    // 输出的 所有高斯 2D协方差的逆 和 不透明度 数组
 		tile_grid,                  // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
-		geomState.tiles_touched,    // 输出的 所有高斯 覆盖的tile数量 数组
+		geomState.tiles_touched,    // 输出的 所有高斯 在图像平面覆盖的线程块 tile的个数 数组
 		prefiltered                 // 预滤除的标志，默认为False
 	), debug)
 
@@ -345,7 +345,8 @@ int CudaRasterizer::Rasterizer::forward(
     //! 3. 渲染
     // 具体实现在 forward.cu/renderCUDA
 	CHECK_CUDA(FORWARD::render(
-		tile_grid, block,
+		tile_grid,
+        block,
 		imgState.ranges,
 		binningState.point_list,
 		width, height,
