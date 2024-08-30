@@ -407,6 +407,7 @@ __global__ void preprocessCUDA(
 }
 
 // Backward version of the rendering procedure.
+// 反向渲染过程的模板函数
 template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
@@ -426,6 +427,7 @@ renderCUDA(
 	float* __restrict__ dL_dcolors)
 {
 	// We rasterize again. Compute necessary block info.
+    // 重新进行光栅化计算，计算所需的块信息
 	auto block = cg::this_thread_block();
 	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
 	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
@@ -435,6 +437,7 @@ renderCUDA(
 	const float2 pixf = { (float)pix.x, (float)pix.y };
 
 	const bool inside = pix.x < W&& pix.y < H;
+    // 当前处理的tile对应的3D gaussian的起始id和结束id
 	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
 
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
@@ -450,16 +453,18 @@ renderCUDA(
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors.
     // 核心就是根据alpha合成的公式，手推每个变量的反向传播公式，推导过程可参考论文里的附录。
+    // 在正向传播中，存储了T的最终值，即所有(1 - alpha)因子的乘积
 	const float T_final = inside ? final_Ts[pix_id] : 0;
 	float T = T_final;
 
 	// We start from the back. The ID of the last contributing
 	// Gaussian is known from each pixel from the forward.
+    // 从后面开始。最后一个贡献的高斯的ID是从每个像素的正向传播中已知的
 	uint32_t contributor = toDo;
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
 	float accum_rec[C] = { 0 };
-	float dL_dpixel[C];
+	float dL_dpixel[C];     // 当前pixel对应的梯度
 	if (inside)
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
@@ -467,8 +472,8 @@ renderCUDA(
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
 
-	// Gradient of pixel coordinate w.r.t. normalized 
-	// screen-space viewport corrdinates (-1 to 1)
+	// Gradient of pixel coordinate w.r.t. normalized screen-space viewport corrdinates (-1 to 1)
+    // 从后面开始加载辅助数据到共享内存中，并以相反顺序加载
 	const float ddelx_dx = 0.5 * W;
 	const float ddely_dy = 0.5 * H;
 
@@ -477,6 +482,8 @@ renderCUDA(
 	{
 		// Load auxiliary data into shared memory, start in the BACK
 		// and load them in revers order.
+        // 将辅助数据加载到共享内存中，从后面开始
+        // 并以相反的顺序加载它们。
 		block.sync();
 		const int progress = i * BLOCK_SIZE + block.thread_rank();
 		if (range.x + progress < range.y)
@@ -491,15 +498,17 @@ renderCUDA(
 		block.sync();
 
 		// Iterate over Gaussians
+        // 迭代高斯
 		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
 		{
-			// Keep track of current Gaussian ID. Skip, if this one
-			// is behind the last contributor for this pixel.
+			// Keep track of current Gaussian ID. Skip, if this one is behind the last contributor for this pixel.
+            // 跟踪当前高斯的ID。如果这个高斯位于这个像素的最后一个贡献者之后，就跳过
 			contributor--;
 			if (contributor >= last_contributor)
 				continue;
 
 			// Compute blending values, as before.
+            // 像之前一样计算混合值
 			const float2 xy = collected_xy[j];
 			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			const float4 con_o = collected_conic_opacity[j];
@@ -515,15 +524,15 @@ renderCUDA(
 			T = T / (1.f - alpha);
 			const float dchannel_dcolor = alpha * T;
 
-			// Propagate gradients to per-Gaussian colors and keep
-			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
-			// pair).
+			// Propagate gradients to per-Gaussian colors and keep gradients w.r.t. alpha (blending factor for a Gaussian/pixel pair).
+            // 将梯度传播到每个高斯的颜色，并保留关于alpha（高斯/像素对的混合因子）的梯度
 			float dL_dalpha = 0.0f; // 可以通过 alpha compositing 的公式，利用 chain rule 倒推各个参数的梯度。
 			const int global_id = collected_id[j];
 			for (int ch = 0; ch < C; ch++)
 			{
 				const float c = collected_colors[ch * BLOCK_SIZE + j];
 				// Update last color (to be used in the next iteration)
+                // 更新最后的颜色（用于下一次迭代）
 				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
 				last_color[ch] = c;
 
@@ -532,14 +541,20 @@ renderCUDA(
 				// Update the gradients w.r.t. color of the Gaussian. 
 				// Atomic, since this pixel is just one of potentially
 				// many that were affected by this Gaussian.
+                // 更新关于高斯颜色的梯度。
+                // 使用原子操作，因为这个像素只是可能
+                // 受此高斯影响的众多像素之一
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 			}
 			dL_dalpha *= T;
 			// Update last alpha (to be used in the next iteration)
+            //更新最后的alpha（用于下一次迭代）
 			last_alpha = alpha;
 
 			// Account for fact that alpha also influences how much of
 			// the background color is added if nothing left to blend
+            // 考虑到alpha还会影响如果没有其他内容可混合时
+            // 添加多少背景颜色的事实
 			float bg_dot_dpixel = 0;
 			for (int i = 0; i < C; i++)
 				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
@@ -547,6 +562,7 @@ renderCUDA(
 
 
 			// Helpful reusable temporary variables
+            // 有用的可重用临时变量
 			const float dL_dG = con_o.w * dL_dalpha;
 			const float gdx = G * d.x;
 			const float gdy = G * d.y;
@@ -554,15 +570,18 @@ renderCUDA(
 			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
 
 			// Update gradients w.r.t. 2D mean position of the Gaussian
+            // 更新关于高斯的2D均值位置的梯度
 			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
 			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
 
 			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
+            // 更新关于2D协方差（2x2矩阵，对称）的梯度
 			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
 			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
 			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
 
 			// Update gradients w.r.t. opacity of the Gaussian
+            // 更新关于高斯不透明度的梯度
 			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
 		}
 	}
@@ -592,10 +611,9 @@ void BACKWARD::preprocess(
 	glm::vec3* dL_dscale,
 	glm::vec4* dL_drot)
 {
-	// Propagate gradients for the path of 2D conic matrix computation. 
-	// Somewhat long, thus it is its own kernel rather than being part of 
-	// "preprocess". When done, loss gradient w.r.t. 3D means has been
-	// modified and gradient w.r.t. 3D covariance matrix has been computed.	
+    // 传播用于2D圆锥矩阵计算路径的梯度。
+    // 由于过程较长，因此它有自己的内核，而不是作为“预处理”的一部分。
+    // 完成后，损失梯度相对于3D均值已被修改，且相对于3D协方差矩阵的梯度已被计算。
 	computeCov2DCUDA << <(P + 255) / 256, 256 >> > (
 		P,
 		means3D,
@@ -610,9 +628,8 @@ void BACKWARD::preprocess(
 		(float3*)dL_dmean3D,
 		dL_dcov3D);
 
-	// Propagate gradients for remaining steps: finish 3D mean gradients,
-	// propagate color gradients to SH (if desireD), propagate 3D covariance
-	// matrix gradients to scale and rotation.
+    // 传播剩余步骤的梯度：完成3D均值梯度，
+    // 将颜色梯度传播到球谐系数（如果需要），将3D协方差矩阵的梯度传播到尺度和旋转。
 	preprocessCUDA<NUM_CHANNELS> << < (P + 255) / 256, 256 >> > (
 		P, D, M,
 		(float3*)means3D,
@@ -650,6 +667,7 @@ void BACKWARD::render(
 	float* dL_dopacity,
 	float* dL_dcolors)
 {
+    // 调用CUDA内核函数执行光栅化过程
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
 		point_list,

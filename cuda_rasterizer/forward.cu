@@ -338,29 +338,30 @@ renderCUDA(
 	float* __restrict__ out_color)              //存储最终渲染结果的数组
 {
 	// Identify current tile and associated min/max pixel range.
-    // 1.确定当前像素范围：
+    // 1. 确定当前像素范围：
     // 这部分代码用于确定当前线程块要处理的像素范围，包括 pix_min 和 pix_max，并计算当前线程对应的像素坐标 pix
 	auto block = cg::this_thread_block();
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
-	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
-	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
-	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
-	uint32_t pix_id = W * pix.y + pix.x;
-	float2 pixf = { (float)pix.x, (float)pix.y };
+
+	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };   // 当前处理的tile的左上角的像素坐标
+	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };  // 当前处理的tile的右下角的像素坐标
+	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y }; // 当前处理的像素坐标
+	uint32_t pix_id = W * pix.y + pix.x;        // 当前处理的像素id
+	float2 pixf = { (float)pix.x, (float)pix.y };   // 当前处理的像素坐标
 
 	// Check if this thread is associated with a valid pixel or outside.
-    // 2.判断当前线程是否在有效像素范围内：
+    // 2. 判断当前线程是否在有效像素范围内：
     // 根据像素坐标判断当前线程是否在有效的图像范围内，如果不在，则将 done 设置为 true，表示该线程无需执行渲染操作
 	bool inside = pix.x < W&& pix.y < H;
 	// Done threads can help with fetching, but don't rasterize
 	bool done = !inside;
 
 	// Load start/end range of IDs to process in bit sorted list.
-    // 3.加载点云数据处理范围：
+    // 3. 加载点云数据处理范围：
     // 这部分代码加载当前线程块要处理的点云数据的范围，即 ranges 数组中对应的范围，并计算点云数据的迭代批次 rounds 和总共要处理的点数 toDo
-	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];    // 当前处理的tile对应的3D gaussian的起始id和结束id
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
-	int toDo = range.y - range.x;
+	int toDo = range.y - range.x;   // 还有多少3D gaussian需要处理
 
 	// Allocate storage for batches of collectively fetched data.
     // 4. 初始化共享内存，分别定义三个共享内存数组，用于在每个线程块内共享数据
@@ -370,7 +371,7 @@ renderCUDA(
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 
 	// Initialize helper variables
-    // 5.初始化渲染相关变量：
+    // 5. 初始化渲染相关变量：
     // 初始化渲染所需的一些变量，包括当前像素颜色 C、贡献者数量
 	float T = 1.0f;
 	uint32_t contributor = 0;
@@ -378,7 +379,7 @@ renderCUDA(
 	float C[CHANNELS] = { 0 };
 
 	// Iterate over batches until all done or range is complete
-    // 6.迭代处理点云数据：
+    // 6. 迭代处理点云数据：
     // 在每个迭代中，处理一批点云数据。内部循环迭代每个点，进行基于锥体参数的渲染计算，并更新颜色信息
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE) {
         // 代码使用 rounds 控制循环的迭代次数，每次迭代处理一批点云数据
@@ -393,6 +394,7 @@ renderCUDA(
 		int progress = i * BLOCK_SIZE + block.thread_rank();
 		if (range.x + progress < range.y)
 		{
+            // 当前处理的3D gaussian的id
 			int coll_id = point_list[range.x + progress];
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
@@ -412,9 +414,10 @@ renderCUDA(
             // 计算当前点的投影坐标与锥体参数的差值：
             // 计算当前点在屏幕上的坐标 xy 与当前像素坐标 pixf 的差值，并使用锥体参数计算 power。
             // Resample using conic matrix (cf. "Surface
-			float2 xy = collected_xy[j];
-			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
-			float4 con_o = collected_conic_opacity[j];
+			float2 xy = collected_xy[j];    // 当前处理的2D gaussian在图像上的中心点坐标
+			float2 d = { xy.x - pixf.x, xy.y - pixf.y };    // 当前处理的2D gaussian的中心点到当前处理的pixel的offset
+			float4 con_o = collected_conic_opacity[j];              // 当前处理的2D gaussian的协方差矩阵的逆矩阵以及它的不透明度
+            // 计算高斯分布的强度（或权重），用于确定像素在光栅化过程中的贡献程度
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
@@ -450,10 +453,10 @@ renderCUDA(
 	// All threads that treat valid pixel write out their final
 	// rendering data to the frame and auxiliary buffers.
 	if (inside) {
-        //7. 写入最终渲染结果：
+        // 7. 写入最终渲染结果：
         // 如果当前线程在有效像素范围内，则将最终的渲染结果写入相应的缓冲区，包括 final_T、n_contrib 和 out_color
-		final_T[pix_id] = T;    // 用于反向传播计算梯度
-		n_contrib[pix_id] = last_contributor;   // 记录数量，用于提前停止计算
+		final_T[pix_id] = T;    // 用于反向传播计算梯度（？渲染过程后每个像素的最终透明度或透射率值）
+		n_contrib[pix_id] = last_contributor;   // 记录数量，用于提前停止计算（？最后一个贡献的2D gaussian是谁）
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 	}
@@ -462,16 +465,16 @@ renderCUDA(
 //! 渲染的主函数
 void FORWARD::render(
 	const dim3 grid, dim3 block,
-	const uint2* ranges,
-	const uint32_t* point_list,
-	int W, int H,
-	const float2* means2D,
-	const float* colors,
-	const float4* conic_opacity,
-	float* final_T,
-	uint32_t* n_contrib,
-	const float* bg_color,
-	float* out_color)
+	const uint2* ranges,        // 每个瓦片（tile）在排序后的高斯ID列表中的范围
+	const uint32_t* point_list, // 排序后的3D gaussian的id列表
+	int W, int H,           // 图像的宽和高
+	const float2* means2D,  // 每个2D gaussian在图像上的中心点位置
+	const float* colors,    // 每个3D gaussian对应的RGB颜色
+	const float4* conic_opacity,    // 每个2D gaussian的协方差矩阵的逆矩阵以及它的不透明度
+	float* final_T,     // 渲染过程后每个像素的最终透明度或透射率值
+	uint32_t* n_contrib,    // 每个pixel的最后一个贡献的2D gaussian是谁
+	const float* bg_color,  // 背景颜色
+	float* out_color)       // 输出图像
 {
     // 开始进入CUDA并行计算，将image分为多个block，每个block分配一个进程；每个block里面的pixel分配一个线程；
     // 对于每个block只排序一次，认为block里面的pixel都被block中的所有gaussian影响且顺序一样。

@@ -19,11 +19,10 @@
 namespace CudaRasterizer
 {
     /**
-     * 从一个动态分配的内存块中提取并初始化指定类型的数组指针
-     * @tparam T
-     * @param chunk 输入/输出参数,指向动态分配的内存块的起始地址。函数执行后，chunk会被更新为下一个可用的内存块地址
-     * @param ptr   输出参数,初始化为指向内存块中指定类型 T数组的指针
-     * @param count 要初始化的 T 类型元素的个数
+     * 从一个动态分配的内存块（chunk）中为不同类型的数组（ptr）分配空间
+     * @param chunk 输入/输出参数，指向动态分配的内存块的起始地址。函数执行后，chunk会被更新为下一个可用的内存块地址
+     * @param ptr   输出参数，一个指向分配数组的指针引用
+     * @param count 数组中元素的数量
      * @param alignment 内存对齐的字节数，通常为 128字节
      */
 	template <typename T>
@@ -34,6 +33,7 @@ namespace CudaRasterizer
 		chunk = reinterpret_cast<char*>(ptr + count);   // 将 chunk 指针向前移动,使其指向下一个可用的内存块起始位置
 	}
 
+    // 存储所有高斯的各个参数的结构体
 	struct GeometryState
 	{
 		size_t scan_size;
@@ -62,16 +62,20 @@ namespace CudaRasterizer
 
 	struct BinningState
 	{
-		size_t sorting_size;
-		uint64_t* point_list_keys_unsorted;
-		uint64_t* point_list_keys;
-		uint32_t* point_list_unsorted;
-		uint32_t* point_list;
-		char* list_sorting_space;
+		size_t sorting_size;        // 存储用于排序操作的缓冲区大小
+		uint64_t* point_list_keys_unsorted; // 未排序的键列表
+		uint64_t* point_list_keys;          // 排序后的键列表
+		uint32_t* point_list_unsorted;  // 未排序的点列表
+		uint32_t* point_list;           // 排序后的点列表
+		char* list_sorting_space;   // 用于排序操作的缓冲区
 
 		static BinningState fromChunk(char*& chunk, size_t P);
 	};
 
+
+    // 计算存储 T 类型数据所需的内存大小的函数
+    // 通过调用 T::fromChunk 并传递一个空指针（nullptr）来模拟内存分配过程
+    // 通过这个过程，它确定了实际所需的内存大小，加上额外的 128 字节以满足可能的内存对齐要求
 	template<typename T> 
 	size_t required(size_t P)
 	{

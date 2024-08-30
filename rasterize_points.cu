@@ -29,7 +29,7 @@
  * Rasterizer类在cuda_rasterizer文件夹下的 rasterizer.h、rasterizer_impl.h、rasterizer_impl.cu中定义
  */
 
-// 返回一个能动态调整内存缓冲区大小的函数指针
+// 创建并返回一个 lambda 表达式，该表达式用于调整 torch::Tensor对象（内存缓冲区）的大小，并返回一个指向它数据的原始指针
 std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) { //输入的张量为 要动态管理的内存缓冲区
     auto lambda = [&t](size_t N) {
         t.resize_({(long long)N});  // 调整t的大小为N
@@ -84,7 +84,7 @@ RasterizeGaussiansCUDA(
   // 4. 创建用于管理内存分配的辅助函数
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
-  torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
+  torch::Tensor geomBuffer = torch::empty({0}, options.device(device));         // 存储所有高斯的参数的 tensor：包括中心位置、缩放因子、旋转四元数、不透明度
   torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
   torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
   // geomFunc、binningFunc、imgFunc 是三个函数指针，其指向的函数可以动态调整内存缓冲区的大小
