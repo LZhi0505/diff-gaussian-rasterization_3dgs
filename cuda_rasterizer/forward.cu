@@ -114,10 +114,12 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 	// 计算高斯中心在相机坐标系中的位置（在视锥中的位置）
 	float3 t = transformPoint4x3(mean, viewmatrix);
 
+    // 定义x和y方向的视锥限制
 	const float limx = 1.3f * tan_fovx;
 	const float limy = 1.3f * tan_fovy;
 	const float txtz = t.x / t.z;
 	const float tytz = t.y / t.z;
+
 	t.x = min(limx, max(-limx, txtz)) * t.z;
 	t.y = min(limy, max(-limy, tytz)) * t.z;
 
@@ -220,14 +222,14 @@ __global__ void preprocessCUDA(
 	const int W, int H,         // 输出图像的宽、高
 	const float tan_fovx, float tan_fovy,
 	const float focal_x, float focal_y,
-	int* radii,                 // 输出的 所有高斯 投影在图像平面的最大半径 数组
-	float2* points_xy_image,    // 输出的 所有高斯 中心在图像平面的二维坐标 数组
-	float* depths,              // 输出的 所有高斯 中心在相机坐标系下的z值 数组
+	int* radii,                 // 输出的 所有高斯 投影在当前相机图像平面的最大半径 数组
+	float2* points_xy_image,    // 输出的 所有高斯 中心在当前相机图像平面的二维坐标 数组
+	float* depths,              // 输出的 所有高斯 中心在当前相机坐标系下的z值 数组
 	float* cov3Ds,              // 输出的 所有高斯 在世界坐标系下的3D协方差矩阵 数组
 	float* rgb,                 // 输出的 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	float4* conic_opacity,      // 输出的 所有高斯 2D协方差的逆 和 不透明度 数组
 	const dim3 grid,            // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
-	uint32_t* tiles_touched,    // 输出的 所有高斯 在图像平面覆盖的线程块 tile的个数 数组
+	uint32_t* tiles_touched,    // 输出的 所有高斯 在当前相机图像平面覆盖的线程块 tile的个数 数组
 	bool prefiltered)           // 预滤除的标志，默认为False
 {
     // 1. 获取当前线程在CUDA grid中的全局索引，即当前线程处理的高斯的索引
@@ -315,7 +317,7 @@ __global__ void preprocessCUDA(
 }
 
 
-//! 光栅化最终的渲染步骤，渲染计算每个像素的颜色
+//! 光栅化的渲染步骤，计算每个像素的颜色
 // 在一个block上协作，每个线程负责一个像素，在获取数据 与 光栅化数据之间交替。在这个过程中，每个像素的颜色是通过考虑所有影响该像素的高斯来计算的。
 // (1) 通过计算当前线程所属的 tile 的范围，确定当前线程要处理的像素区域
 // (2) 判断当前线程是否在有效像素范围内，如果不在，则将 done 设置为 true，表示该线程不执行渲染操作
@@ -326,16 +328,16 @@ __global__ void preprocessCUDA(
 template <uint32_t CHANNELS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)    // CUDA 启动核函数时使用的线程格和线程块的数量
 renderCUDA(
-	const uint2* __restrict__ ranges,   // 包含每个范围的起始和结束索引的数组
-	const uint32_t* __restrict__ point_list,    // 包含了点的索引的数组f
+	const uint2* __restrict__ ranges,   // 每个线程块 tile在排序后的高斯ID列表中的范围 数组，包含起始和结束索引
+	const uint32_t* __restrict__ point_list,    // 排序后的高斯的ID列表的数组
 	int W, int H,
-	const float2* __restrict__ points_xy_image, // 包含每个点在屏幕上的坐标的数组
+	const float2* __restrict__ points_xy_image, // 所有高斯 中心在当前相机图像平面的二维坐标 的数组
 	const float* __restrict__ features,         // 包含每个点的颜色信息的数组
-	const float4* __restrict__ conic_opacity,   // 包含每个点的锥体参数和透明度信息的数组
-	float* __restrict__ final_T,                // 用于存储每个像素的最终颜色的数组。（多个叠加？）
-	uint32_t* __restrict__ n_contrib,           // 用于存储每个像素的贡献计数的数组
-	const float* __restrict__ bg_color,         // 如果提供了背景颜色，将其作为背景
-	float* __restrict__ out_color)              //存储最终渲染结果的数组
+	const float4* __restrict__ conic_opacity,   // 所有高斯 2D协方差矩阵的逆 和 不透明度 的数组
+	float* __restrict__ final_T,                // 输出的 渲染过程后每个像素 pixel的最终透明度或透射率值 的数组
+	uint32_t* __restrict__ n_contrib,           // 输出的 每个像素 pixel的最后一个贡献的高斯 的数组
+	const float* __restrict__ bg_color,         // 提供的背景颜色，默认为[1,1,1]，黑色
+	float* __restrict__ out_color)              // 输出的 RGB图像
 {
 	// Identify current tile and associated min/max pixel range.
     // 1. 确定当前像素范围：
@@ -464,19 +466,20 @@ renderCUDA(
 
 //! 渲染的主函数
 void FORWARD::render(
-	const dim3 grid, dim3 block,
-	const uint2* ranges,        // 每个瓦片（tile）在排序后的高斯ID列表中的范围
-	const uint32_t* point_list, // 排序后的3D gaussian的id列表
-	int W, int H,           // 图像的宽和高
-	const float2* means2D,  // 每个2D gaussian在图像上的中心点位置
-	const float* colors,    // 每个3D gaussian对应的RGB颜色
-	const float4* conic_opacity,    // 每个2D gaussian的协方差矩阵的逆矩阵以及它的不透明度
-	float* final_T,     // 渲染过程后每个像素的最终透明度或透射率值
-	uint32_t* n_contrib,    // 每个pixel的最后一个贡献的2D gaussian是谁
-	const float* bg_color,  // 背景颜色
-	float* out_color)       // 输出图像
+	const dim3 grid,    // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
+    dim3 block,         // 线程块 block在水平和垂直方向上的线程数
+	const uint2* ranges,        // 每个线程块 tile在排序后的高斯ID列表中的范围
+	const uint32_t* point_list, // 排序后的高斯的ID列表
+	int W, int H,
+	const float2* means2D,  // 已计算的 所有高斯 中心在当前相机图像平面的二维坐标
+	const float* colors,    // 每个3D高斯对应的RGB颜色
+	const float4* conic_opacity,    // 已计算的 所有高斯 2D协方差矩阵的逆 和 不透明度
+	float* final_T,         // 渲染过程后每个像素 pixel的最终透明度或透射率值
+	uint32_t* n_contrib,    // 每个像素 pixel的最后一个贡献的高斯是谁
+	const float* bg_color,  // 背景颜色，默认为[1,1,1]，黑色
+	float* out_color)       // 输出的 RGB图像
 {
-    // 开始进入CUDA并行计算，将image分为多个block，每个block分配一个进程；每个block里面的pixel分配一个线程；
+    // 开始进入CUDA并行计算，将图像分为多个线程块（分配一个 进程）；每个线程块为每个像素分配一个线程；
     // 对于每个block只排序一次，认为block里面的pixel都被block中的所有gaussian影响且顺序一样。
     // 在forward中，沿camera从前往后遍历gaussian，计算颜色累计值和透明度累计值，直到透明度累计超过1或者遍历完成，然后用背景色和颜色累计值和透明度累计值计算这个pixel的最终颜色。
     // 在backward中，遍历顺序与forward相反，从（之前记录下来的）最终透明度累计值和其对应的最后一个gaussian开始，从后往前算梯度。
@@ -517,14 +520,14 @@ void FORWARD::preprocess(
 	const int W, int H,
 	const float focal_x, float focal_y,
 	const float tan_fovx, float tan_fovy,   // tan(fov_x/2)和tan(fov_y/2)
-	int* radii,             // 输出的 所有高斯 投影在图像平面的最大半径 数组
-	float2* means2D,        // 输出的 所有高斯 中心在图像平面的二维坐标 数组
-	float* depths,          // 输出的 所有高斯 中心在相机坐标系下的z值 数组
+	int* radii,             // 输出的 所有高斯 投影在当前相机图像平面的最大半径 数组
+	float2* means2D,        // 输出的 所有高斯 中心在当前相机图像平面的二维坐标 数组
+	float* depths,          // 输出的 所有高斯 中心在当前相机坐标系下的z值 数组
 	float* cov3Ds,          // 输出的 所有高斯 在世界坐标系下的3D协方差矩阵 数组
 	float* rgb,             // 输出的 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	float4* conic_opacity,  // 输出的 所有高斯 2D协方差的逆 和 不透明度 数组
 	const dim3 grid,        // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
-	uint32_t* tiles_touched,    // 输出的 所有高斯 在图像平面覆盖的线程块 tile的个数 数组
+	uint32_t* tiles_touched,    // 输出的 所有高斯 在当前相机图像平面覆盖的线程块 tile的个数 数组
 	bool prefiltered)       // 预滤除的标志，默认为False
 {
     /**

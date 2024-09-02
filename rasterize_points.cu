@@ -217,12 +217,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 }
 
 torch::Tensor markVisible(
-		torch::Tensor& means3D,
-		torch::Tensor& viewmatrix,
-		torch::Tensor& projmatrix)
+		torch::Tensor& means3D,     // 所有高斯 中心的世界坐标
+		torch::Tensor& viewmatrix,  // 观测变换矩阵，W2C
+		torch::Tensor& projmatrix)  // 观测变换*投影变换矩阵，W2NDC = W2C * C2NDC
 { 
-  const int P = means3D.size(0);
-  
+  const int P = means3D.size(0);    // 所有高斯的个数
+
+  // 初始化 present (N，)为全 False的 Tensor
   torch::Tensor present = torch::full({P}, false, means3D.options().dtype(at::kBool));
  
   if(P != 0)
