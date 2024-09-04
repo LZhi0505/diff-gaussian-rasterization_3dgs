@@ -317,7 +317,7 @@ __global__ void preprocessCUDA(
 }
 
 
-//! 光栅化的渲染步骤，计算每个像素的颜色
+//! 渲染：计算每个 像素 的颜色（一个线程）
 // 在一个block上协作，每个线程负责一个像素，在获取数据 与 光栅化数据之间交替。在这个过程中，每个像素的颜色是通过考虑所有影响该像素的高斯来计算的。
 // (1) 通过计算当前线程所属的 tile 的范围，确定当前线程要处理的像素区域
 // (2) 判断当前线程是否在有效像素范围内，如果不在，则将 done 设置为 true，表示该线程不执行渲染操作
@@ -325,33 +325,34 @@ __global__ void preprocessCUDA(
 // (4) 在每个迭代中，从全局内存中收集每个线程块对应的范围内的数据，包括点的索引、2D 坐标和锥体参数透明度。
 // (5) 对当前线程块内的每个点，进行基于锥体参数的渲染，计算贡献并更新颜色。
 // (6) 所有线程处理完毕后，将渲染结果写入 final_T、n_contrib 和 out_color
-template <uint32_t CHANNELS>
+template <uint32_t CHANNELS>    // CHANNELS取3，即RGB三个通道
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)    // CUDA 启动核函数时使用的线程格和线程块的数量
 renderCUDA(
 	const uint2* __restrict__ ranges,   // 每个线程块 tile在排序后的高斯ID列表中的范围 数组，包含起始和结束索引
-	const uint32_t* __restrict__ point_list,    // 排序后的高斯的ID列表的数组
+	const uint32_t* __restrict__ point_list,    // 按 tile、深度排序后的高斯的ID列表 的数组
 	int W, int H,
 	const float2* __restrict__ points_xy_image, // 所有高斯 中心在当前相机图像平面的二维坐标 的数组
-	const float* __restrict__ features,         // 包含每个点的颜色信息的数组
+	const float* __restrict__ features,         // 所有高斯 RGB颜色信息 的数组
 	const float4* __restrict__ conic_opacity,   // 所有高斯 2D协方差矩阵的逆 和 不透明度 的数组
 	float* __restrict__ final_T,                // 输出的 渲染过程后每个像素 pixel的最终透明度或透射率值 的数组
-	uint32_t* __restrict__ n_contrib,           // 输出的 每个像素 pixel的最后一个贡献的高斯 的数组
+	uint32_t* __restrict__ n_contrib,           // 输出的 每个像素 pixel的最后一个贡献的高斯 的数组（？多少个高斯对该像素有贡献）
 	const float* __restrict__ bg_color,         // 提供的背景颜色，默认为[1,1,1]，黑色
 	float* __restrict__ out_color)              // 输出的 RGB图像
 {
 	// Identify current tile and associated min/max pixel range.
     // 1. 确定当前像素范围：
     // 这部分代码用于确定当前线程块要处理的像素范围，包括 pix_min 和 pix_max，并计算当前线程对应的像素坐标 pix
-	auto block = cg::this_thread_block();
-	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	auto block = cg::this_thread_block();   // 获取当前线程所处的 block（对应一个 tile）
+	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X; // 在水平方向上有多少个 block
 
-	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };   // 当前处理的tile的左上角的像素坐标
-	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };  // 当前处理的tile的右下角的像素坐标
-	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y }; // 当前处理的像素坐标
-	uint32_t pix_id = W * pix.y + pix.x;        // 当前处理的像素id
-	float2 pixf = { (float)pix.x, (float)pix.y };   // 当前处理的像素坐标
+    // block.group_index()：当前线程所处的 block在 grid中的三维索引。block.thread_index()：当前线程在 block中的三维索引
+	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };   // 当前处理的 tile的 左上角 像素坐标
+	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };  // 当前处理的 tile的 右下角 像素坐标
+	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y }; // 当前处理的 像素 在图像平面的坐标
 
-	// Check if this thread is associated with a valid pixel or outside.
+    uint32_t pix_id = W * pix.y + pix.x;        // 当前处理的 像素 的索引
+	float2 pixf = { (float)pix.x, (float)pix.y };   // 当前处理的 像素 在图像平面的坐标
+
     // 2. 判断当前线程是否在有效像素范围内：
     // 根据像素坐标判断当前线程是否在有效的图像范围内，如果不在，则将 done 设置为 true，表示该线程无需执行渲染操作
 	bool inside = pix.x < W&& pix.y < H;

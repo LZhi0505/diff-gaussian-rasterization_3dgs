@@ -17,12 +17,12 @@
 #include <cuda.h>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
-#include <cub/cub.cuh>
+#include <cub/cub.cuh>      // CUDA的CUB库
 #include <cub/device/device_radix_sort.cuh>
 #define GLM_FORCE_CUDA
-#include <glm/glm.hpp>
+#include <glm/glm.hpp>      // GLM (OpenGL Mathematics)库
 
-#include <cooperative_groups.h>
+#include <cooperative_groups.h>     // CUDA 9引入的Cooperative Groups库
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
@@ -30,9 +30,31 @@ namespace cg = cooperative_groups;
 #include "forward.h"
 #include "backward.h"
 
+/**
+ * 引用库的介绍
+ * 1. cooperative_groups库（同步）
+ * __syncthreads()函数提供了在一个 block内同步各线程的方法，但有时要同步 block内的一部分线程或者多个 block的线程，这时候就需要 Cooperative Groups库。这个库定义了划分和同步一组线程的方法
+ * 在3DGS中方法仅以两种方式被调用：
+ * (1) auto idx = cg::this_grid().thread_rank();    其中 cg::this_grid()返回一个 cg::grid_group实例，表示当前线程所处的 grid。它有一个方法 thread_rank()返回当前线程在该 grid中排第几
+ * (2) auto block = cg::this_thread_block();    其中 cg::this_thread_block返回一个 cg::thread_block实例，表示当前线程所处的 block，用到的成员函数有：
+ *      block.sync()：同步该 block中的所有线程（等价于__syncthreads()）
+ *      block.thread_rank()：返回非负整数，表示当前线程在该 block中排第几
+ *      block.group_index()：返回一个 cg::dim3实例，表示该 block在 grid中的三维索引
+ *      block.thread_index()：返回一个 cg::dim3实例，表示当前线程在 block中的三维索引
+ *
+ * 2. CUB库（并行处理）
+ * 针对不同的计算等级：线程、wap、block、device等设计了并行算法。例如，reduce函数有四个版本：ThreadReduce、WarpReduce、BlockReduce、DeviceReduce
+ * diff-gaussian-rasterization模块调用了CUB库的两个函数：
+ * (1) cub::DeviceScan::InclusiveSum    计算前缀和，"Inclusive"就是第 i 个数被计入第 i 个和中
+ * (2) cub::DeviceRadixSort::SortPairs  device级别的并行基数 升序排序
+ *
+ * 3. GLM库
+ * 专为图形学设计的只有头文件的C++数学库
+ * 3DGS只用到了 glm::vec3（三维向量）, glm::vec4（四维向量）, glm::mat3（3×3矩阵）, glm::dot（向量点积）
+ */
 
-// Helper function to find the next-highest bit of the MSB on the CPU.
-// 寻找给定无符号整数 n 的最高有效位（Most Significant Bit, MSB）的下一个最高位
+
+// 在CPU上查找 给定无符号整数 n 的最高有效位（Most Significant Bit, MSB）的下一个最高位
 uint32_t getHigherMsb(uint32_t n)
 {
 	uint32_t msb = sizeof(n) * 4;
@@ -50,8 +72,8 @@ uint32_t getHigherMsb(uint32_t n)
 	return msb;
 }
 
-// Wrapper method to call auxiliary coarse frustum containment test.
-// Mark all Gaussians that pass it.
+
+// 检查某个线程的高斯是否在当前相机的视锥体内，bool类型输出到 present数组内
 __global__ void checkFrustum(
     int P,          // 所有高斯的个数
 	const float* orig_points,   // 所有高斯 中心的世界坐标
@@ -69,15 +91,19 @@ __global__ void checkFrustum(
 	present[idx] = in_frustum(idx, orig_points, viewmatrix, projmatrix, false, p_view);
 }
 
-// Generates one key/value pair for all Gaussian / tile overlaps. 
-// Run once per Gaussian (1:N mapping).
+
+/**
+ * 为每个高斯生成 用于排序的 [key | value]对，以便在后续操作中按深度对高斯进行排序，为每个高斯运行一次（1:N 映射）
+ * key：每个tile对应的深度（depth）
+ * value: 对应的高斯索引
+ */
 __global__ void duplicateWithKeys(
 	int P,      // 所有高斯的个数
 	const float2* points_xy,    // 预处理计算的 所有高斯 中心在当前相机图像平面的二维坐标 数组
 	const float* depths,        // 预处理计算的 所有高斯 中心在当前相机坐标系下的z值 数组
 	const uint32_t* offsets,
-	uint64_t* gaussian_keys_unsorted,
-	uint32_t* gaussian_values_unsorted,
+	uint64_t* gaussian_keys_unsorted,   // 输出的 未排序的 keys
+	uint32_t* gaussian_values_unsorted, // 输出的 未排序的 values
 	int* radii,     // 预处理计算的 所有高斯 投影在当前相机图像平面的最大半径 数组
 	dim3 grid)      // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
 {
@@ -86,11 +112,10 @@ __global__ void duplicateWithKeys(
 	if (idx >= P)
 		return;
 
-	// Generate no key/value pair for invisible Gaussians
+    // 当前相机看不见某高斯，则不生成[key | value]对
 	if (radii[idx] > 0)
 	{
-        // 当前高斯 在当前相机图片图像平面有投影
-		// Find this Gaussian's offset in buffer for writing keys/values.
+        // 寻找该高斯在缓冲区的 offset，以生成[key | value]对
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
         //
 		uint2 rect_min, rect_max;
@@ -150,7 +175,7 @@ __global__ void identifyTileRanges(
 		ranges[currtile].y = L;     // 边界条件：最后一个tile的终止位置
 }
 
-// 基于当前相机的视锥，标记所有高斯是否被当前相机可见
+// 检查所有高斯是否被在当前相机的视锥体内，即是否被当前相机看见，标志保存在 present数组中
 void CudaRasterizer::Rasterizer::markVisible(
 	int P,          // 所有高斯的个数
 	float* means3D,     // 所有高斯 中心的世界坐标
@@ -166,7 +191,7 @@ void CudaRasterizer::Rasterizer::markVisible(
 }
 
 // CUDA内存状态类，用于在GPU内存中存储和管理不同类型的数据
-// fromChunk 从以char数组形式存储的二进制块中读取 GeometryState、ImageState、BinningState等类的信息
+// fromChunk：从以 char数组形式存储的二进制块中读取 GeometryState、ImageState、BinningState等类的信息
 /**
  * (1) 存储与高斯几何相关的信息，从动态分配的内存块(char*& chunk)中 提取并初始化 GeometryState结构（与高斯各参数的数据成员）
  * 使用 obtain 函数为 GeometryState 的不同成员分配空间，并返回一个初始化的 GeometryState 实例
@@ -268,9 +293,9 @@ int CudaRasterizer::Rasterizer::forward(
 		radii = geomState.internal_radii;
 	}
 
-    // 3. 定义一个三维CUDA网格 tile_grid，确定了在水平和垂直方向上需要多少个线程块来覆盖整个渲染区域，即W/16，H/16
+    // 3. 定义一个 tile_grid的大小，即在水平和垂直方向上需要多少个线程块来覆盖整个渲染区域，W/16，H/16
 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
-    // 定义每个线程块 block，确定了在水平和垂直方向上的线程数。每个线程处理一个像素，则每个线程块处理16*16个像素
+    // 定义一个 block的大小，即在水平和垂直方向上的线程数。每个线程处理一个像素，则每个线程块处理16*16个像素
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
 
 	// 4. 分配、初始化图像信息 ImageState
@@ -313,53 +338,58 @@ int CudaRasterizer::Rasterizer::forward(
     //! 6. 高斯排序和合成顺序：根据高斯距离摄像机的远近来计算每个高斯在Alpha合成中的顺序
     // ---开始--- 通过视图变换 W 计算出像素与所有重叠高斯的距离，即这些高斯的深度，形成一个有序的高斯列表
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
-    // 计算所有高斯 投影到当前相机图像平面上 其投影圆覆盖的线程块 tile的个数的 前缀和
-    // 计算出每个Gaussian对应的keys和values在数组中存储的起始位置
-	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
+    // 在GPU上并行计算每个高斯 投影到当前相机图像平面上 其投影圆覆盖的线程块 tile的个数的 前缀和，结果存储在 point_offsets中
+    // 前缀和的目的：计算出每个高斯对应的 tile在数组中的起始位置（为 duplicateWithKeys做准备）
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space,  // 额外需要的临时显存空间
+                                             geomState.scan_size,       // 临时显存空间的大小
+                                             geomState.tiles_touched,   // 输入指针，已计算的 所有高斯 投影到当前相机图像平面覆盖的 tile个数的 数组
+                                             geomState.point_offsets,   // 输出指针，每个高斯对应的 tile在数组中的起始位置
+                                             P      // 元素个数
+                                             ), debug)
 
-	// Retrieve total number of Gaussian instances to launch and resize aux buffers
-    // 检索启动和调整aux缓冲区大小的高斯实例总数
-    // 从 GPU内存复制最后一个高斯点的偏移量,得到需要渲染的高斯实例总数
-    // 存储所有的2D gaussian总共覆盖了多少个tile
+    // 计算所有高斯 投影到二维图像平面上 总共覆盖的 tile的个数
 	int num_rendered;
-    // 将 geomState.point_offsets 数组中最后一个元素的值复制到主机内存中的变量 num_rendered
+    // 从 GPU内存复制最后一个高斯的偏移量，得到需要渲染的高斯的总数
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
 
-    // 6.3 分配、初始化排序信息 BinningState
+    // 6.3 分配、初始化排序信息 BinningState，存储要 排序的[key | value]对 和 排序后的结果
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
-	// For each instance to be rendered, produce adequate [ tile | depth ] key 
-	// and corresponding dublicated Gaussian indices to be sorted
-    // 将每个3D gaussian的对应的tile index和深度存到point_list_keys_unsorted中
+	// 对于每个要渲染的高斯, 生成 [ tile | depth ] key，和对应的 要排序的 高斯索引
+    // 将每个高斯的对应的 tile index 和 深度存到 point_list_keys_unsorted中
     // 将每个3D gaussian的对应的index（第几个3D gaussian）存到point_list_unsorted中 // 生成排序所用的keys和values
-	duplicateWithKeys << <(P + 255) / 256, 256 >> > (   // 根据 tile，复制 Gaussian
+	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
 		P,
 		geomState.means2D,  // 预处理计算的 所有高斯 中心在当前相机图像平面的二维坐标 数组
 		geomState.depths,   // 预处理计算的 所有高斯 中心在当前相机坐标系下的z值 数组
-		geomState.point_offsets,    //
-		binningState.point_list_keys_unsorted,
-		binningState.point_list_unsorted,
+		geomState.point_offsets,    // 所有高斯的偏移量数组
+		binningState.point_list_keys_unsorted,  // 未排序的键
+		binningState.point_list_unsorted,       // 未排序的值
 		radii,          // 预处理计算的 所有高斯 投影在当前相机图像平面的最大半径 数组
-		tile_grid)      // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
+		tile_grid)      // 生成排序所用的 keys和 values。CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
 	CHECK_CUDA(, debug)
 
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
 
-	// Sort complete list of (duplicated) Gaussian indices by keys
+
     // 对一个键值对列表进行排序。这里的键值对由 binningState.point_list_keys_unsorted 和 binningState.point_list_unsorted 组成
     // 排序后的结果存储在 binningState.point_list_keys 和 binningState.point_list 中
     // binningState.list_sorting_space 和 binningState.sorting_size 指定了排序操作所需的临时存储空间和其大小
     // num_rendered 是要排序的元素总数。0, 32 + bit 指定了排序的最低位和最高位，这里用于确保排序考虑到了足够的位数，以便正确处理所有的键值对
     // Sort complete list of (duplicated) Gaussian indices by keys
-    // 进行排序，按keys排序：每个tile对应的Gaussians按深度放在一起；value是Gaussian的ID
+    // 进行排序，按keys的大小升序排序：每个 tile对应的多个高斯按深度放在一起；value是Gaussian的ID
+    // cub::DeviceRadixSort::SortPairs：device级别的并行基数排序，根据 key的大小将 (key, value)对 进行稳定的升序排序
 	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
-		binningState.list_sorting_space,
-		binningState.sorting_size,
-		binningState.point_list_keys_unsorted, binningState.point_list_keys,
-		binningState.point_list_unsorted, binningState.point_list,
-		num_rendered, 0, 32 + bit), debug)
+		binningState.list_sorting_space,    // 排序时用到的临时显存空间
+		binningState.sorting_size,                      // 临时显存空间的大小
+		binningState.point_list_keys_unsorted, binningState.point_list_keys,    // key的输入和输出指针
+		binningState.point_list_unsorted, binningState.point_list,  // value的输入和输出指针
+		num_rendered,   // 对多少个条目进行排序
+        0,          // 低位
+        32 + bit    // 高位，按照[begin_bit, end_bit)内的位进行排序
+        ), debug)
 
     // 将 imgState.ranges 数组中的所有元素设置为 0
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
@@ -379,7 +409,7 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
 
     //! 7. 渲染
-    // 具体实现在 forward.cu/renderCUDA
+    // 一个线程负责一个像素，一个block负责一个tile。线程在读取数据（把数据从公用显存拉到 block自己的显存）和进行计算之间来回切换，使得线程们可以共同读取高斯数据，这样做的原因是block共享内存比公共显存快得多。具体实现在 forward.cu/renderCUDA
 	CHECK_CUDA(FORWARD::render(
 		tile_grid,     // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
         block,              // 定义的线程块 block在水平和垂直方向上的线程数
