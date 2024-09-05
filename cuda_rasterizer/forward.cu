@@ -387,6 +387,8 @@ renderCUDA(
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE) {
         // 代码使用 rounds 控制循环的迭代次数，每次迭代处理一批点云数据
 		// End if entire block votes that it is done rasterizing
+        // 检查是否所有线程块都已经完成渲染：
+        // 通过 __syncthreads_count 统计已经完成渲染的线程数，如果整个线程块都已完成，则跳出循环
 		int num_done = __syncthreads_count(done);
 		if (num_done == BLOCK_SIZE)
 			break;

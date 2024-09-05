@@ -17,14 +17,14 @@ namespace cg = cooperative_groups;
 
 
 /**
- * 对每个3D高斯，将球谐函数转换为RGB的反向传播
- * @param idx   当前3D高斯的索引
- * @param deg   指定的3D高斯球谐函数的阶数
+ * 对每个高斯，将球谐函数转换为RGB的 反向传播
+ * @param idx   当前高斯的索引
+ * @param deg   指定的球谐函数的 阶数
  * @param max_coeffs    球谐函数的系数个数
- * @param means         每个3D高斯 中心的坐标
- * @param campos        相机位置
- * @param shs           每个3D高斯的 球谐系数
- * @param clamped       每个3D高斯是否需要进行截断
+ * @param means         每个高斯中心的 世界坐标
+ * @param campos        当前相机的世界坐标
+ * @param shs           每个高斯的 球谐系数
+ * @param clamped       每个高斯是否需要进行截断
  * @param dL_dcolor     目标颜色对 RGB颜色空间 的导数
  * @param dL_dmeans     目标颜色对 3D高斯中心 的导数
  * @param dL_dshs       目标颜色对 球谐函数系数 的导数
@@ -55,7 +55,7 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 	glm::vec3* dL_dsh = dL_dshs + idx * max_coeffs;
 
 	// No tricks here, just high school-level calculus.
-	float dRGBdsh0 = SH_C0;
+	float dRGBdsh0 = SH_C0;     // 对球鞋系数 0 阶的梯度
 	dL_dsh[0] = dRGBdsh0 * dL_dRGB;
 	if (deg > 0)
 	{
