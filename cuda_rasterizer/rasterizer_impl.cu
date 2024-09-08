@@ -45,7 +45,7 @@ namespace cg = cooperative_groups;
  * 2. CUB库（并行处理）
  * 针对不同的计算等级：线程、wap、block、device等设计了并行算法。例如，reduce函数有四个版本：ThreadReduce、WarpReduce、BlockReduce、DeviceReduce
  * diff-gaussian-rasterization模块调用了CUB库的两个函数：
- * (1) cub::DeviceScan::InclusiveSum    计算前缀和，"Inclusive"就是第 i 个数被计入第 i 个和中
+ * (1) cub::DeviceScan::InclusiveSum    计算前缀和，'InclusiveSum'是从第一个元素 累加到 当前元素 的和
  * (2) cub::DeviceRadixSort::SortPairs  device级别的并行基数 升序排序
  *
  * 3. GLM库
@@ -57,17 +57,19 @@ namespace cg = cooperative_groups;
 // 在CPU上查找 给定无符号整数 n 的最高有效位（Most Significant Bit, MSB）的下一个最高位
 uint32_t getHigherMsb(uint32_t n)
 {
-	uint32_t msb = sizeof(n) * 4;
+	uint32_t msb = sizeof(n) * 4;   // 4 * 4 = 16
 	uint32_t step = msb;
 	while (step > 1)
 	{
-		step /= 2;
+		step /= 2;      // 缩小2倍
 		if (n >> msb)
+            // 右移16位，相当于除以2的16次方
 			msb += step;
 		else
 			msb -= step;
 	}
 	if (n >> msb)
+        // 如果n的最高位大于0，则msb+1
 		msb++;
 	return msb;
 }
@@ -93,15 +95,15 @@ __global__ void checkFrustum(
 
 
 /**
- * 为每个高斯生成 用于排序的 [key | value]对，以便在后续操作中按深度对高斯进行排序，为每个高斯运行一次（1:N 映射）
- * key：每个tile对应的深度（depth）
- * value: 对应的高斯索引
+ * 为每个高斯生成 用于排序的 key-value，以便在后续操作中按深度对高斯进行排序
+ * key：     uint64_t，前32位，其该高斯覆盖的每个tile 的ID，后32位，该高斯的 depth
+ * value:   该高斯的 ID
  */
 __global__ void duplicateWithKeys(
 	int P,      // 所有高斯的个数
 	const float2* points_xy,    // 预处理计算的 所有高斯 中心在当前相机图像平面的二维坐标 数组
-	const float* depths,        // 预处理计算的 所有高斯 中心在当前相机坐标系下的z值 数组
-	const uint32_t* offsets,
+	const float* depths,        // 预处理计算的 所有高斯 中心在当前相机坐标系下的z值（深度） 数组
+	const uint32_t* offsets,    // 所有高斯 覆盖的 tile的 前缀和 数组
 	uint64_t* gaussian_keys_unsorted,   // 输出的 未排序的 keys
 	uint32_t* gaussian_values_unsorted, // 输出的 未排序的 values
 	int* radii,     // 预处理计算的 所有高斯 投影在当前相机图像平面的最大半径 数组
@@ -112,30 +114,28 @@ __global__ void duplicateWithKeys(
 	if (idx >= P)
 		return;
 
-    // 当前相机看不见某高斯，则不生成[key | value]对
+    // 只有该3D高斯投影到当前相机的图像平面的最大半径 > 0，即当前相机看见了该高斯，才生成 key-value
 	if (radii[idx] > 0)
 	{
-        // 寻找该高斯在缓冲区的 offset，以生成[key | value]对
+        // 该高斯 前面的那些高斯已经覆盖的 tile的总数，即前一个高斯覆盖的tile的终止位置，也是该高斯覆盖的tile的起始位置
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
-        //
+        // 计算该高斯投影到当前相机图像平面的 覆盖区域的左上角和右下角 tile块坐标
 		uint2 rect_min, rect_max;
-        // 计算该高斯投影在当前相机图像平面的影响范围（左上角和右下角坐标的 线程块坐标），以给高斯覆盖的每个tile生成一个(key, value)对
 		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
 
-        // 对于边界矩形重叠的每个瓦片，具有一个键/值对。
-        // 键是 | 瓦片ID | 深度 |，
-        // 值是高斯的ID，按照这个键对值进行排序，将得到一个高斯ID列表，
-        // 这样它们首先按瓦片排序，然后按深度排序
+        // 遍历该高斯 覆盖的每个 tile，为其生成一个 key-value
 		for (int y = rect_min.y; y < rect_max.y; y++)
 		{
 			for (int x = rect_min.x; x < rect_max.x; x++)
 			{
-				uint64_t key = y * grid.x + x;  // tile的ID
-				key <<= 32;         // 放在高位
-				key |= *((uint32_t*)&depths[idx]);      // 低位是深度
-				gaussian_keys_unsorted[off] = key;
+				uint64_t key = y * grid.x + x;  // tile在整幅图像的 ID
+				key <<= 32;         // 高位存 tile ID
+				key |= *((uint32_t*) & depths[idx]);      // 低位存 该3D高斯在当前相机坐标系下的 深度
+
+                // 为该高斯覆盖的当前 tile 分配 key-value
+                gaussian_keys_unsorted[off] = key;
 				gaussian_values_unsorted[off] = idx;
-				off++;      // 数组中的偏移量
+				off++;      // tile数组中的偏移量
 			}
 		}
 	}
@@ -210,6 +210,8 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.rgb, P * 3, 128);    // 所有高斯的 RGB颜色
 	obtain(chunk, geom.tiles_touched, P, 128);  // 所有高斯 覆盖的 tile数量
 
+    // 计算前缀和，InclusiveSum表示包括自身，ExclusiveSum表示不包括自身
+    // 当临时所需的显存空间为 NULL时，所需的分配空间大小被写入到 第二个参数中，并且不执行任何操作
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
 
     obtain(chunk, geom.scanning_space, geom.scan_size, 128);    // 用于计算前缀和的中间缓冲区，数据的对齐方式为 128字节
@@ -338,35 +340,33 @@ int CudaRasterizer::Rasterizer::forward(
     //! 6. 高斯排序和合成顺序：根据高斯距离摄像机的远近来计算每个高斯在Alpha合成中的顺序
     // ---开始--- 通过视图变换 W 计算出像素与所有重叠高斯的距离，即这些高斯的深度，形成一个有序的高斯列表
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
-    // 在GPU上并行计算每个高斯 投影到当前相机图像平面上 其投影圆覆盖的线程块 tile的个数的 前缀和，结果存储在 point_offsets中
-    // 前缀和的目的：计算出每个高斯对应的 tile在数组中的起始位置（为 duplicateWithKeys做准备）
+    // 在GPU上并行计算 每个高斯投影到当前相机图像平面上 2D高斯覆盖的 tile个数的 前缀和，结果存储在 point_offsets，提供了每个高斯覆盖tile区域的累加结束位置
+    // 是为 所有高斯投影到图像平面上覆盖的所有 tile分配唯一的 ID
 	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space,  // 额外需要的临时显存空间
                                              geomState.scan_size,       // 临时显存空间的大小
-                                             geomState.tiles_touched,   // 输入指针，已计算的 所有高斯 投影到当前相机图像平面覆盖的 tile个数的 数组
-                                             geomState.point_offsets,   // 输出指针，每个高斯对应的 tile在数组中的起始位置
-                                             P      // 元素个数
+                                             geomState.tiles_touched,   // 输入指针，已计算的 每个高斯 投影到当前相机图像平面覆盖的 tile个数的 数组
+                                             geomState.point_offsets,   // 输出指针，指向一个数组，每个元素是 从第一个高斯到当前高斯所覆盖的所有 tile的 数量
+                                             P      // 所有高斯的个数
                                              ), debug)
 
-    // 计算所有高斯 投影到二维图像平面上 总共覆盖的 tile的个数
+    // 计算所有高斯 投影到二维图像平面上覆盖的 tile的总个数
 	int num_rendered;
-    // 从 GPU内存复制最后一个高斯的偏移量，得到需要渲染的高斯的总数
+    // 将 point_offsets数组的最后一个元素，即所有高斯投影到当前相机图像平面上所覆盖的 tile的 总数，从GPU复制到CPU的变量 num_rendered中
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
 
-    // 6.3 分配、初始化排序信息 BinningState，存储要 排序的[key | value]对 和 排序后的结果
+    // 6.3 分配、初始化排序信息 BinningState，存储要 排序的 key-value对 和 排序后的结果
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
-	// 对于每个要渲染的高斯, 生成 [ tile | depth ] key，和对应的 要排序的 高斯索引
-    // 将每个高斯的对应的 tile index 和 深度存到 point_list_keys_unsorted中
-    // 将每个3D gaussian的对应的index（第几个3D gaussian）存到point_list_unsorted中 // 生成排序所用的keys和values
+	// 对于每个要渲染的高斯, 生成排序所用的 key-value，其中，key：[ tile ID | 投影深度 ]；value：要排序的3D高斯的 ID
 	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
 		P,
 		geomState.means2D,  // 预处理计算的 所有高斯 中心在当前相机图像平面的二维坐标 数组
-		geomState.depths,   // 预处理计算的 所有高斯 中心在当前相机坐标系下的z值 数组
-		geomState.point_offsets,    // 所有高斯的偏移量数组
-		binningState.point_list_keys_unsorted,  // 未排序的键
-		binningState.point_list_unsorted,       // 未排序的值
+		geomState.depths,   // 预处理计算的 所有高斯 中心在当前相机坐标系下的z值（深度） 数组
+		geomState.point_offsets,    // 所有高斯覆盖的 tile个数的 前缀和
+		binningState.point_list_keys_unsorted,  // 未排序的 keys（uint64_t）
+		binningState.point_list_unsorted,       // 未排序的 values
 		radii,          // 预处理计算的 所有高斯 投影在当前相机图像平面的最大半径 数组
 		tile_grid)      // 生成排序所用的 keys和 values。CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
 	CHECK_CUDA(, debug)
