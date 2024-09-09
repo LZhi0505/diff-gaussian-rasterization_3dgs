@@ -47,7 +47,7 @@ namespace FORWARD
 		uint32_t* tiles_touched,
 		bool prefiltered);
 
-    // 光栅化的主函数
+    // 光栅化的 渲染
 	void render(
 		const dim3 grid, dim3 block,
 		const uint2* ranges,

@@ -328,11 +328,11 @@ __global__ void preprocessCUDA(
 template <uint32_t CHANNELS>    // CHANNELS取3，即RGB三个通道
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)    // CUDA 启动核函数时使用的线程格和线程块的数量
 renderCUDA(
-	const uint2* __restrict__ ranges,   // 每个线程块 tile在排序后的高斯ID列表中的范围 数组，包含起始和结束索引
-	const uint32_t* __restrict__ point_list,    // 按 tile、深度排序后的高斯的ID列表 的数组
+	const uint2* __restrict__ ranges,   // 每个tile在 排序后的keys列表中的 起始和终止位置
+	const uint32_t* __restrict__ point_list,    // 按 tile ID、高斯深度 排序后的 高斯ID列表
 	int W, int H,
 	const float2* __restrict__ points_xy_image, // 所有高斯 中心在当前相机图像平面的二维坐标 的数组
-	const float* __restrict__ features,         // 所有高斯 RGB颜色信息 的数组
+	const float* __restrict__ features,         // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float4* __restrict__ conic_opacity,   // 所有高斯 2D协方差矩阵的逆 和 不透明度 的数组
 	float* __restrict__ final_T,                // 输出的 渲染过程后每个像素 pixel的最终透明度或透射率值 的数组
 	uint32_t* __restrict__ n_contrib,           // 输出的 每个像素 pixel的最后一个贡献的高斯 的数组（？多少个高斯对该像素有贡献）
@@ -467,18 +467,18 @@ renderCUDA(
 	}
 }
 
-//! 渲染的主函数
+//! 渲染
 void FORWARD::render(
-	const dim3 grid,    // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
-    dim3 block,         // 线程块 block在水平和垂直方向上的线程数
-	const uint2* ranges,        // 每个线程块 tile在排序后的高斯ID列表中的范围
-	const uint32_t* point_list, // 排序后的高斯的ID列表
+	const dim3 grid,    // 定义的CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数，(W/16，H/16)
+    dim3 block,         // 定义的线程块 block的维度，(16, 16, 1)
+	const uint2* ranges,        // 每个tile在 排序后的keys列表中的 起始和终止位置
+	const uint32_t* point_list, // 按 tile ID、高斯深度 排序后的 高斯ID 列表
 	int W, int H,
 	const float2* means2D,  // 已计算的 所有高斯 中心在当前相机图像平面的二维坐标
-	const float* colors,    // 每个3D高斯对应的RGB颜色
+	const float* colors,    // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float4* conic_opacity,    // 已计算的 所有高斯 2D协方差矩阵的逆 和 不透明度
-	float* final_T,         // 渲染过程后每个像素 pixel的最终透明度或透射率值
-	uint32_t* n_contrib,    // 每个像素 pixel的最后一个贡献的高斯是谁
+	float* final_T,         // 输出的 渲染过程后每个像素 pixel的最终透明度或透射率值
+	uint32_t* n_contrib,    // 输出的 每个像素 pixel的最后一个贡献的高斯是谁
 	const float* bg_color,  // 背景颜色，默认为[1,1,1]，黑色
 	float* out_color)       // 输出的 RGB图像
 {

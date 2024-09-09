@@ -63,10 +63,10 @@ namespace CudaRasterizer
 	struct BinningState
 	{
 		size_t sorting_size;        // 存储用于排序操作的缓冲区大小
-		uint64_t* point_list_keys_unsorted; // 未排序的键列表
-		uint64_t* point_list_keys;          // 排序后的键列表
-		uint32_t* point_list_unsorted;  // 未排序的点列表
-		uint32_t* point_list;           // 排序后的点列表
+		uint64_t* point_list_keys_unsorted; // 未排序的 key列表，[tile ID | 3D高斯的深度]
+		uint64_t* point_list_keys;          // 排序后的 key列表
+		uint32_t* point_list_unsorted;  // 未排序的 value列表，[3D高斯的 ID]
+		uint32_t* point_list;           // 排序后的 value列表
 		char* list_sorting_space;   // 用于排序操作的缓冲区
 
 		static BinningState fromChunk(char*& chunk, size_t P);
