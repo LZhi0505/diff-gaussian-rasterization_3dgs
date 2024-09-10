@@ -339,49 +339,45 @@ renderCUDA(
 	const float* __restrict__ bg_color,         // 提供的背景颜色，默认为[1,1,1]，黑色
 	float* __restrict__ out_color)              // 输出的 RGB图像
 {
-	// Identify current tile and associated min/max pixel range.
-    // 1. 确定当前像素范围：
-    // 这部分代码用于确定当前线程块要处理的像素范围，包括 pix_min 和 pix_max，并计算当前线程对应的像素坐标 pix
+    // 1. 确定当前block处理的 tile的像素范围
+    // pix_min： 当前处理的 tile的 左上角像素坐标
+    // pix_max： 当前处理的 tile的 右下角像素坐标
+    // pix：     当前处理的 像素 在像素平面的坐标
 	auto block = cg::this_thread_block();   // 获取当前线程所处的 block（对应一个 tile）
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X; // 在水平方向上有多少个 block
+	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };       // block.group_index()：当前线程所处的 block在 grid中的三维索引
+	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };     // block.thread_index()：当前线程在 block中的三维索引
 
-    // block.group_index()：当前线程所处的 block在 grid中的三维索引。block.thread_index()：当前线程在 block中的三维索引
-	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };   // 当前处理的 tile的 左上角 像素坐标
-	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };  // 当前处理的 tile的 右下角 像素坐标
-	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y }; // 当前处理的 像素 在图像平面的坐标
+    uint32_t pix_id = W * pix.y + pix.x;        // 当前处理的 像素 在像素平面的　索引
+	float2 pixf = { (float)pix.x, (float)pix.y };   // 当前处理的 像素 在像素平面的坐标
 
-    uint32_t pix_id = W * pix.y + pix.x;        // 当前处理的 像素 的索引
-	float2 pixf = { (float)pix.x, (float)pix.y };   // 当前处理的 像素 在图像平面的坐标
-
-    // 2. 判断当前线程是否在有效像素范围内：
-    // 根据像素坐标判断当前线程是否在有效的图像范围内，如果不在，则将 done 设置为 true，表示该线程无需执行渲染操作
-	bool inside = pix.x < W&& pix.y < H;
-	// Done threads can help with fetching, but don't rasterize
+    // 2. 判断当前线程处理的　像素　是否在有效像素范围内
+	bool inside = pix.x < W　&& pix.y < H;
+    // 如果不在，则将 done设为 true，表示该线程无需执行渲染操作
 	bool done = !inside;
 
 	// Load start/end range of IDs to process in bit sorted list.
     // 3. 加载点云数据处理范围：
     // 这部分代码加载当前线程块要处理的点云数据的范围，即 ranges 数组中对应的范围，并计算点云数据的迭代批次 rounds 和总共要处理的点数 toDo
-	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];    // 当前处理的tile对应的3D gaussian的起始id和结束id
+    // 根据当前处理的 tile ID 获取其在排序后的 keys列表中的起始、终止位置
+	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+    // 将任务分成 rounds批，每一批处理 BLOCK_SIZE个像素（高斯）
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
-	int toDo = range.y - range.x;   // 还有多少3D gaussian需要处理
+	int toDo = range.y - range.x;   // 还有多少像素（高斯）需要处理
 
-	// Allocate storage for batches of collectively fetched data.
-    // 4. 初始化共享内存，分别定义三个共享内存数组，用于在每个线程块内共享数据
+    // 4. 初始化共享内存，分别定义三个共享内存数组，用于在每个线程块内共享数据。
     // 每个线程取一个，并行读数据到 shared memory。然后每个线程都访问该shared memory，读取顺序一致。
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 
-	// Initialize helper variables
-    // 5. 初始化渲染相关变量：
-    // 初始化渲染所需的一些变量，包括当前像素颜色 C、贡献者数量
+    // 5. 初始化渲染相关变量，包括当前像素颜色 C、贡献者数量
 	float T = 1.0f;
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
 
-	// Iterate over batches until all done or range is complete
     // 6. 迭代处理点云数据：
     // 在每个迭代中，处理一批点云数据。内部循环迭代每个点，进行基于锥体参数的渲染计算，并更新颜色信息
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE) {
