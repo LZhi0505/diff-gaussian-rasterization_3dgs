@@ -328,7 +328,7 @@ __global__ void preprocessCUDA(
 template <uint32_t CHANNELS>    // CHANNELS取3，即RGB三个通道
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)    // CUDA 启动核函数时使用的线程格和线程块的数量
 renderCUDA(
-	const uint2* __restrict__ ranges,   // 每个tile在 排序后的keys列表中的 起始和终止位置
+	const uint2* __restrict__ ranges,   // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数表示多少个高斯落在该tile内
 	const uint32_t* __restrict__ point_list,    // 按 tile ID、高斯深度 排序后的 高斯ID列表
 	int W, int H,
 	const float2* __restrict__ points_xy_image, // 所有高斯 中心在当前相机图像平面的二维坐标 的数组
@@ -352,50 +352,45 @@ renderCUDA(
     uint32_t pix_id = W * pix.y + pix.x;        // 当前处理的 像素 在像素平面的　索引
 	float2 pixf = { (float)pix.x, (float)pix.y };   // 当前处理的 像素 在像素平面的坐标
 
-    // 2. 判断当前线程处理的　像素　是否在有效像素范围内
+    // 2. 判断当前线程处理的　像素　是否在图像有效像素范围内
 	bool inside = pix.x < W　&& pix.y < H;
     // 如果不在，则将 done设为 true，表示该线程无需执行渲染操作
 	bool done = !inside;
 
-	// Load start/end range of IDs to process in bit sorted list.
-    // 3. 加载点云数据处理范围：
-    // 这部分代码加载当前线程块要处理的点云数据的范围，即 ranges 数组中对应的范围，并计算点云数据的迭代批次 rounds 和总共要处理的点数 toDo
-    // 根据当前处理的 tile ID 获取其在排序后的 keys列表中的起始、终止位置
+    // 3. 加载点云数据处理范围
+    // 根据当前处理的 tile ID 获取该 tile在排序后的 keys列表中的起始、终止位置
 	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
-    // 将任务分成 rounds批，每一批处理 BLOCK_SIZE个像素（高斯）
+    // 将渲染任务分成 rounds批，每一批处理 BLOCK_SIZE = 16*16个高斯
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
-	int toDo = range.y - range.x;   // 还有多少像素（高斯）需要处理
+	int toDo = range.y - range.x;   // 投影到该tile上的 高斯的个数
 
-    // 4. 初始化共享内存，分别定义三个共享内存数组，用于在每个线程块内共享数据。
-    // 每个线程取一个，并行读数据到 shared memory。然后每个线程都访问该shared memory，读取顺序一致。
-	__shared__ int collected_id[BLOCK_SIZE];
+    // 4. 初始化同一block中的各线程共享的内存，分别定义三个共享内存数组，用于在每个block内共享数据
+	__shared__ int collected_id[BLOCK_SIZE];    // __shared__: 同一block中的各线程共享的内存（读取顺序一致）
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 
     // 5. 初始化渲染相关变量，包括当前像素颜色 C、贡献者数量
-	float T = 1.0f;
-	uint32_t contributor = 0;
+	float T = 1.0f;     // transmittance，透光率
+	uint32_t contributor = 0;   // 多少个高斯对 该像素的颜色有贡献
 	uint32_t last_contributor = 0;
-	float C[CHANNELS] = { 0 };
+	float C[CHANNELS] = { 0 };  // 渲染结果。
 
-    // 6. 迭代处理点云数据：
-    // 在每个迭代中，处理一批点云数据。内部循环迭代每个点，进行基于锥体参数的渲染计算，并更新颜色信息
+    // 6. 遍历每批任务，任务一批处理 BLOCK_SIZE = 16*16个高斯，内部循环迭代高斯，进行基于锥体参数的渲染计算，并更新颜色信息
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE) {
-        // 代码使用 rounds 控制循环的迭代次数，每次迭代处理一批点云数据
-		// End if entire block votes that it is done rasterizing
-        // 检查是否所有线程块都已经完成渲染：
-        // 通过 __syncthreads_count 统计已经完成渲染的线程数，如果整个线程块都已完成，则跳出循环
-		int num_done = __syncthreads_count(done);
+        // 使用 rounds 控制循环的迭代次数，每次迭代处理一批点云数据
+        // 检查是否所有线程块都已经完成渲染
+		int num_done = __syncthreads_count(done);   // 通过 __syncthreads_count统计已经完成渲染的线程数
 		if (num_done == BLOCK_SIZE)
+            // 如果所有线程块都已完成，则跳出循环
 			break;
 
 		// Collectively fetch per-Gaussian data from global to shared
-        // 共享内存中获取点云数据：
+        // 共享内存中获取点云数据
         // 每个线程通过索引 progress 计算要加载的点云数据的索引 coll_id，然后从全局内存中加载到共享内存 collected_id、collected_xy 和 collected_conic_opacity 中。block.sync() 确保所有线程都加载完成
 		int progress = i * BLOCK_SIZE + block.thread_rank();
 		if (range.x + progress < range.y)
 		{
-            // 当前处理的3D gaussian的id
+            // 当前处理的高斯的ID
 			int coll_id = point_list[range.x + progress];
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
@@ -467,7 +462,7 @@ renderCUDA(
 void FORWARD::render(
 	const dim3 grid,    // 定义的CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数，(W/16，H/16)
     dim3 block,         // 定义的线程块 block的维度，(16, 16, 1)
-	const uint2* ranges,        // 每个tile在 排序后的keys列表中的 起始和终止位置
+	const uint2* ranges,        // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数表示多少个高斯落在该tile内
 	const uint32_t* point_list, // 按 tile ID、高斯深度 排序后的 高斯ID 列表
 	int W, int H,
 	const float2* means2D,  // 已计算的 所有高斯 中心在当前相机图像平面的二维坐标

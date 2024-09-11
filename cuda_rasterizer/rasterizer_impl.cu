@@ -401,7 +401,7 @@ int CudaRasterizer::Rasterizer::forward(
 		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
 			num_rendered,       // 排序的 tile总个数，即所有高斯 投影到二维图像平面上覆盖的 tile的总个数
 			binningState.point_list_keys,   // 根据tile ID和高斯深度排序后的 keys列表
-			imgState.ranges);   // 输出的 每个tile在 排序后的keys列表中的 起始和终止位置
+			imgState.ranges);   // 输出的 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数表示多少个高斯落在该tile内
 	CHECK_CUDA(, debug)
 
 
@@ -415,7 +415,7 @@ int CudaRasterizer::Rasterizer::forward(
 	CHECK_CUDA(FORWARD::render(
 		tile_grid,     // 定义的CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数，(W/16，H/16)
         block,              // 定义的线程块 block的维度，(16, 16, 1)
-		imgState.ranges,    // 每个tile在 排序后的keys列表中的 起始和终止位置
+		imgState.ranges,    // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数表示多少个高斯落在该tile内
 		binningState.point_list,    // 按 tile ID、高斯深度 排序后的 高斯ID 列表
 		width, height,
 		geomState.means2D,  // 已计算的 所有高斯 中心在当前相机图像平面的二维坐标 数组
