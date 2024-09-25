@@ -221,7 +221,10 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	return geom;
 }
 
-// (2) 存储与图像渲染相关的信息
+/**
+ * (2) 给 ImageState img分配所需的内存
+ * @param N 图片中 tile的总数
+ */
 CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, size_t N)
 {
 	ImageState img;
@@ -232,7 +235,7 @@ CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, s
 }
 
 /**
- * (3) 初始化 BinningState 实例，分配所需的内存，并执行排序操作
+ * (3) 给 BinningState binning分配所需的内存，并执行排序操作
  */
 CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chunk, size_t P)
 {
@@ -287,10 +290,10 @@ int CudaRasterizer::Rasterizer::forward(
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
-    // 2. 分配、初始化几何信息 geomState
-	size_t chunk_size = required<GeometryState>(P);     // 根据高斯的数量 P，计算存储所有高斯各参数 所需的空间大小
-	char* chunkptr = geometryBuffer(chunk_size);        // 分配指定大小 chunk_size的缓冲区，即给所有高斯的各参数分配存储空间，返回指向该存储空间的指针 chunkptr
-	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);    // 在给定的内存块中初始化 GeometryState 结构体, 为不同成员分配空间，并返回一个初始化的实例
+    // 2. 为 GeometryState分配显存，每个高斯都有一个 GeometryState数据
+	size_t chunk_size = required<GeometryState>(P);     // 根据高斯的数量 P，模版函数 required调用 fromChunk函数来获取内存，返回结束地址，也即所需的存储空间大小
+	char* chunkptr = geometryBuffer(chunk_size);        // 根据所需的存储空间大小，调用 rasterize_points.cu文件中的 resizeFunctional函数里面嵌套的匿名函数 lambda来调整显存块大小，并返回首地址 chunkptr
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);    // 用显存块首地址作为参数，调用 fromChunk函数为 GeometryState geo申请显存
 
 	if (radii == nullptr) {
         // 如果传入的、要输出的 高斯在图像平面的投影半径为 nullptr，则将其设为
@@ -302,7 +305,7 @@ int CudaRasterizer::Rasterizer::forward(
     // 定义一个 block的维度，即在水平和垂直方向上的线程数。每个线程处理一个像素，则每个线程块处理16*16个像素，(16, 16, 1)
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
 
-	// 4. 分配、初始化图像信息 ImageState
+	// 4. 为 ImageState分配显存，每个像素都有一个 ImageState数据
 	size_t img_chunk_size = required<ImageState>(width * height);   // 计算存储所有2D像素各参数 所需的空间大小
 	char* img_chunkptr = imageBuffer(img_chunk_size);                  // 分配存储空间, 并返回指向该存储空间的指针
 	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);  // 在给定的内存块中初始化 ImageState 结构体, 为不同成员分配空间，并返回一个初始化的实例
@@ -339,7 +342,7 @@ int CudaRasterizer::Rasterizer::forward(
 		prefiltered                 // 预滤除的标志，默认为False
 	), debug)
 
-    //! 6. 高斯排序和合成顺序：根据高斯距离摄像机的远近来计算每个高斯在Alpha合成中的顺序
+    //! 6. 高斯排序和合成顺序：根据高斯距离摄像机的远近来并行计算每个高斯在 alpha-blending中的顺序
     // ---开始--- 通过视图变换 W 计算出像素与所有重叠高斯的距离，即这些高斯的深度，形成一个有序的高斯列表
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
     // 在GPU上并行计算 每个高斯投影到当前相机图像平面上 2D高斯覆盖的 tile个数的 前缀和，结果存储在 point_offsets，提供了每个高斯覆盖tile区域的累加结束位置
@@ -356,7 +359,7 @@ int CudaRasterizer::Rasterizer::forward(
     // 将 point_offsets数组的最后一个元素，即所有高斯投影到当前相机图像平面上所覆盖的 tile的 总数，从GPU复制到CPU的变量 num_rendered中
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
 
-    // 6.3 分配、初始化排序信息 BinningState，存储要 排序的 key-value对 和 排序后的结果
+    // 为 BinningState分配显存，即每个高斯覆盖的 tile都有一个 BinningState数据，其存储着 要排序的 key-value对 和 排序后的结果
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
@@ -405,7 +408,7 @@ int CudaRasterizer::Rasterizer::forward(
 	CHECK_CUDA(, debug)
 
 
-    // 每个tile并行地 blend涉及的高斯
+    // 每个 tile并行地 blending涉及的高斯
     // 如果传入的预计算的颜色 不是空指针，则是预计算的颜色
     //                    是空指针，则是预处理中 计算的 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
