@@ -36,38 +36,39 @@ namespace CudaRasterizer
     // 存储所有高斯的各个参数的结构体
 	struct GeometryState
 	{
-		size_t scan_size;
-		float* depths;
-		char* scanning_space;
-		bool* clamped;
+		size_t scan_size; // 临时显存空间的大小
+		float* depths;      // 所有高斯 中心在当前相机坐标系下的z值 数组
+		char* scanning_space; // 额外需要的临时显存空间
+		bool* clamped;      // 所有高斯 是否被裁剪的标志 数组，某位置为 True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
 		int* internal_radii;
-		float2* means2D;
-		float* cov3D;
-		float4* conic_opacity;
-		float* rgb;
-		uint32_t* point_offsets;
-		uint32_t* tiles_touched;
+		float2* means2D;    // 所有高斯 中心投影在当前相机图像平面的二维坐标 数组
+		float* cov3D;       // 所有高斯 在世界坐标系下的3D协方差矩阵 数组
+		float4* conic_opacity;  // 所有高斯 2D协方差的逆 和 不透明度 数组
+		float* rgb;         // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
+		uint32_t* point_offsets;    // 所有高斯 覆盖的 tile个数的 前缀和 数组，每个元素是 从第一个高斯到当前高斯所覆盖的所有tile的数量
+		uint32_t* tiles_touched;    // 所有高斯 在当前相机图像平面覆盖的线程块 tile的个数 数组
 
 		static GeometryState fromChunk(char*& chunk, size_t P);
 	};
 
 	struct ImageState
 	{
-		uint2* ranges;
-		uint32_t* n_contrib;
-		float* accum_alpha;
+		uint2* ranges;  // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数
+		uint32_t* n_contrib;    // 对渲染每个像素 pixel的最后一个有贡献的 高斯ID 的数组
+		float* accum_alpha;     // 渲染后每个像素 pixel的 累积的透射率 的数组
 
 		static ImageState fromChunk(char*& chunk, size_t N);
 	};
 
 	struct BinningState
 	{
-		size_t sorting_size;        // 存储用于排序操作的缓冲区大小
-		uint64_t* point_list_keys_unsorted; // 未排序的 key列表，[tile ID | 3D高斯的深度]
-		uint64_t* point_list_keys;          // 排序后的 key列表
-		uint32_t* point_list_unsorted;  // 未排序的 value列表，[3D高斯的 ID]
+		size_t sorting_size; // 临时显存空间的大小
+		uint64_t* point_list_keys_unsorted; // 未排序的 所有高斯覆盖的tile的 keys列表，分布顺序：大顺序：各高斯，小顺序：该高斯覆盖的各tile_ID。每个元素是 (tile_ID | 3D高斯的深度)
+		uint64_t* point_list_keys;          // 排序后的 keys列表，分布顺序：大顺序：各tile_ID，小顺序：落在该tile内各高斯的深度
+
+        uint32_t* point_list_unsorted;  // 未排序的 所有高斯覆盖的tile的 values列表，每个元素是 对应高斯的ID
 		uint32_t* point_list;           // 排序后的 value列表
-		char* list_sorting_space;   // 用于排序操作的缓冲区
+		char* list_sorting_space; // 排序时用到的临时显存空间
 
 		static BinningState fromChunk(char*& chunk, size_t P);
 	};

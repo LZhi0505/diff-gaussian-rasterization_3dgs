@@ -50,7 +50,7 @@ class _RasterizeGaussians(torch.autograd.Function):
     backward：如何计算自定义操作相对于其输入的梯度，根据前向传播的结果和外部梯度计算输入张量的梯度
 
     forward和 backward函数的输入输出需要相对应：
-        forward输出了color, radii，则 backward输入ctx, grad_out_color, 也就是上下文信息和两个forward输出的变量的grad；
+        forward输出了color, radii，则 backward输入 上下文信息 ctx, forward输出的 渲染的RGB图像 的梯度 grad_out_color
         forward输入了除ctx外9个变量，则 backward返回9个梯度，不需要梯度的变量用None占位
 
     forward和 backward中分别调用了 _C.rasterize_gaussians和 _C.rasterize_gaussians_backward，这是C函数，其桥梁在文件./submodules/diff-gaussian-rasterization/ext.cpp中定义；
@@ -59,7 +59,7 @@ class _RasterizeGaussians(torch.autograd.Function):
     @staticmethod
     # 定义前向渲染的规则，调用C++/CUDA实现的 _C.rasterize_gaussians方法进行高斯光栅化
     # 输入：除ctx外的9个参数
-    # 输出：color, radii
+    # 输出：渲染的RGB图像 color、每个高斯投影在当前相机图像平面上的最大半径 数组 radii
     def forward(
         ctx,    # 上下文信息，用于保存计算中间结果以供反向传播使用
         means3D,
@@ -96,9 +96,11 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.debug           # 默认为False
         )
 
-        # 2. 光栅化
+        # 2. 光栅化（前向传播）
+        # 调用 _C.rasterize_gaussians()进行光栅化，并传入重构到一个元组中的参数。这个函数与 rasterize_points.cu/ RasterizeGaussiansCUDA绑定
+        # 返回：所有高斯覆盖的 tile的总个数、渲染的RGB图像、每个高斯投影在当前相机图像平面上的最大半径 数组、存储所有高斯的 几何、排序、渲染后数据的tensor
         if raster_settings.debug:
-            # 2.1 若光栅器的设置中开启了调试模式，则在计算前向和反向传播时保存了参数的副本，并在出现异常时将其保存到文件中，以供调试
+            # 若光栅器的设置中开启了调试模式，则在计算前向和反向传播时保存了参数的副本，并在出现异常时将其保存到文件中，以供调试
             cpu_args = cpu_deep_copy_tuple(args) # 先深拷贝一份输入参数
             try:
                 # 调用C++/CUDA实现的 _C.rasterize_gaussians()进行光栅化
@@ -108,52 +110,57 @@ class _RasterizeGaussians(torch.autograd.Function):
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
-            # 2.2 默认，不是debug模式，则直接调用 _C.rasterize_gaussians()进行光栅化，并传入重构到一个元组中的参数。这个函数与 rasterize_points.cu/ RasterizeGaussiansCUDA绑定
+            # 不是debug模式（默认）
             num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
 
-        # 记录前向传播输出的tensor到ctx中，用于反向传播
+        # 3. 记录前向传播输出的tensor到ctx中，用于反向传播
         ctx.raster_settings = raster_settings   # 光栅化输入参数
-        ctx.num_rendered = num_rendered
+        ctx.num_rendered = num_rendered     # 渲染的tile的个数
         ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer)
+
         return color, radii
 
     @staticmethod
-    # 定义反向传播梯度下降的规则。根据前向传播的结果和外部梯度计算输入张量的梯度。
-    # 输入：上下文信息、两个forward输出的变量的grad
-    # 输出：forward输入的9个变量的梯度，不需要返回梯度的变量用None占位
-    def backward(ctx, grad_out_color, _):
+    # 定义反向传播梯度下降的规则。调用C++/CUDA实现的 _C.rasterize_gaussians_backward方法
+    # 输入：上下文信息ctx、loss对渲染的RGB图像中每个像素颜色的 梯度
+    # 输出：loss对forward输入的9个变量（所有高斯的 中心投影到图像平面的像素坐标、中心世界坐标、椭圆二次型矩阵、不透明度、当前相机中心观测下高斯的RGB颜色、球谐系数、3D协方差矩阵、缩放因子、旋转四元数）的梯度，不需要返回梯度的变量用None占位
+    def backward(
+            ctx,    # 上下文信息
+            grad_out_color, # loss对渲染的RGB图像中每个像素颜色的 梯度
+            _):
 
-        # Restore necessary values from context
+        # 从ctx中恢复前向传播输出的tensor
         num_rendered = ctx.num_rendered
         raster_settings = ctx.raster_settings
         colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
 
-        # 将梯度和其他输入参数重构为 C++ 方法所期望的形式
-        args = (raster_settings.bg,
-                means3D, 
-                radii, 
-                colors_precomp, 
-                scales, 
-                rotations, 
-                raster_settings.scale_modifier, 
-                cov3Ds_precomp, 
-                raster_settings.viewmatrix, 
-                raster_settings.projmatrix, 
+        # 1. 将梯度和其他输入参数重构为 C++ 方法所期望的形式
+        args = (raster_settings.bg, # 背景颜色，默认为[1,1,1]，黑色
+                means3D,    # 所有高斯 中心的世界坐标
+                radii,      # 所有高斯 投影在当前相机图像平面上的最大半径
+                colors_precomp, # python代码中 预计算的颜色，默认是空tensor
+                scales,     # 所有高斯的 缩放因子
+                rotations,  # 所有高斯的 旋转四元数
+                raster_settings.scale_modifier,     # 缩放因子调节系数
+                cov3Ds_precomp,         # python代码中 预计算的3D协方差矩阵，默认为空tensor
+                raster_settings.viewmatrix,     # 观测变换矩阵，W2C
+                raster_settings.projmatrix,     # 观测变换*投影变换矩阵，W2NDC = W2C * C2NDC
                 raster_settings.tanfovx, 
                 raster_settings.tanfovy, 
-                grad_out_color, 
-                sh, 
-                raster_settings.sh_degree, 
-                raster_settings.campos,
-                geomBuffer,
-                num_rendered,
-                binningBuffer,
-                imgBuffer,
-                raster_settings.debug)
+                grad_out_color,     # loss对渲染的RGB图像中每个像素颜色的 梯度
+                sh,         # 所有高斯的 球谐系数，(N,16,3)
+                raster_settings.sh_degree,  # 当前的球谐阶数
+                raster_settings.campos,     # 当前相机中心的世界坐标
+                geomBuffer,     # 存储所有高斯 几何数据的 tensor：包括2D中心像素坐标、相机坐标系下的深度、3D协方差矩阵等
+                num_rendered,   # 所有高斯覆盖的 tile的总个数
+                binningBuffer,  # 存储所有高斯 排序数据的 tensor：包括未排序和排序后的 所有高斯覆盖的tile的 keys、values列表
+                imgBuffer,      # 存储所有高斯 渲染后数据的 tensor：包括累积的透射率、最后一个贡献的高斯ID
+                raster_settings.debug)  # 默认为False
 
-        # 调用反向传播方法 计算相关tensor的梯度
+        # 2. 反向传播：计算相关tensor的梯度
+        # 调用 _C.rasterize_gaussians_backward()进行反向传播，并传入重构到一个元组中的参数。这个函数与 rasterize_points.cu/ RasterizeGaussiansBackwardCUDA绑定
+        # 返回：loss对 所有高斯的 中心投影到图像平面的像素坐标、中心世界坐标、椭圆二次型矩阵、不透明度、当前相机中心观测下高斯的RGB颜色、球谐系数、3D协方差矩阵、缩放因子、旋转四元数）的梯度
         if raster_settings.debug:
-            # 若光栅器的设置中开启了调试模式，则在计算前向和反向传播时保存了参数的副本，并在出现异常时将其保存到文件中，以供调试
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
                 grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
@@ -162,7 +169,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 print("\nAn error occured in backward. Writing snapshot_bw.dump for debugging.\n")
                 raise ex
         else:
-            # 默认，调用反向传播方法 计算相关tensor的梯度
+            # 不是debug模式（默认）
             grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
 
         # 返回9个参数梯度

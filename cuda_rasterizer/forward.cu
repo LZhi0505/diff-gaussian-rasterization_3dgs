@@ -34,7 +34,7 @@ namespace cg = cooperative_groups;
  * @param means 所有高斯 中心的世界坐标
  * @param campos 当前相机中心的世界坐标
  * @param shs    所有高斯的 球谐系数
- * @param clamped   geomState中记录高斯是否被裁剪的标志，即某位置为 True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
+ * @param clamped   输出的 所有高斯 是否被裁剪的标志 数组，某位置为 True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
  */
 __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, bool* clamped)
 {
@@ -213,7 +213,7 @@ __global__ void preprocessCUDA(
 	const glm::vec4* rotations, // 所有高斯的 旋转四元数
 	const float* opacities,     // 所有高斯的 不透明度
 	const float* shs,           // 所有高斯的 球谐系数
-	bool* clamped,              // geomState中记录高斯是否被裁剪的标志，即某位置为 True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
+	bool* clamped,              // 输出的 所有高斯 是否被裁剪的标志 数组，某位置为 True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
 	const float* cov3D_precomp, // 因预计算的3D协方差矩阵默认是空tensor，则传入的是一个 NULL指针
 	const float* colors_precomp,    // 因预计算的颜色默认是空tensor，则传入的是一个 NULL指针
 	const float* viewmatrix,    // 观测变换矩阵，W2C
@@ -317,14 +317,8 @@ __global__ void preprocessCUDA(
 }
 
 
-//! 渲染：一个block一个tile，一个thread一个像素
-// 在一个block上协作，每个线程负责一个像素，在获取数据 与 光栅化数据之间交替。在这个过程中，每个像素的颜色是通过考虑所有影响该像素的高斯来计算的。
-// (1) 通过计算当前线程所属的 tile 的范围，确定当前线程要处理的像素区域
-// (2) 判断当前线程是否在有效像素范围内，如果不在，则将 done 设置为 true，表示该线程不执行渲染操作
-// (3) 使用 __syncthreads_count 函数，统计当前块内 done 变量为 true 的线程数，如果全部线程都完成，跳出循环
-// (4) 在每个迭代中，从全局内存中收集每个线程块对应的范围内的数据，包括点的索引、2D 坐标和锥体参数透明度。
-// (5) 对当前线程块内的每个点，进行基于锥体参数的渲染，计算贡献并更新颜色。
-// (6) 所有线程处理完毕后，将渲染结果写入 final_T、n_contrib 和 out_color
+//! 渲染：在一个block上协作渲染一个tile内各像素的RGB颜色值，每个线程负责一个像素
+// 每个线程在 读取数据(把数据从公用显存拉到 block自己的显存) 和 进行计算 之间来回切换，使得线程们可以共同读取高斯数据，这样做的原因是block共享显存比公共显存快得多
 template <uint32_t CHANNELS>    // CHANNELS = 3，即RGB三个通道
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)    // CUDA 启动核函数时使用的线程格和线程块的数量
 renderCUDA(
@@ -334,10 +328,10 @@ renderCUDA(
 	const float2* __restrict__ points_xy_image, // 所有高斯 中心在当前相机图像平面的二维坐标 的数组
 	const float* __restrict__ features,         // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float4* __restrict__ conic_opacity,   // 所有高斯 2D协方差矩阵的逆 和 不透明度 的数组
-	float* __restrict__ final_T,                // 输出的 渲染后每个像素 pixel的 累积的透射率
-	uint32_t* __restrict__ n_contrib,           // 输出的 对渲染每个像素 pixel的最后一个有贡献的 高斯ID
+	float* __restrict__ final_T,                // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
+	uint32_t* __restrict__ n_contrib,           // 输出的 对渲染每个像素 pixel的最后一个有贡献的 高斯ID 的数组
 	const float* __restrict__ bg_color,         // 提供的背景颜色，默认为[1,1,1]，黑色
-	float* __restrict__ out_color)              // 输出的 RGB图像
+	float* __restrict__ out_color)              // 输出的 RGB图像（加上了背景颜色）
 {
     // 1. 确定当前block处理的 tile的像素范围
     // pix_min： 当前处理的 tile的 左上角像素坐标
@@ -356,7 +350,7 @@ renderCUDA(
 
     // 2. 判断当前线程处理的 像素 是否在图像有效像素范围内
 	bool inside = pix.x < W　&& pix.y < H;
-    // 如果不在，则将 done设为 true，表示该线程无需执行渲染操作
+    // 如果不在，则将 done设为 true，表示该线程不执行渲染操作
 	bool done = !inside;
 
     // 3. 计算当前tile触及的高斯个数，太多，则分rounds批渲染
@@ -380,11 +374,11 @@ renderCUDA(
     // 6. 外循环：迭代分批渲染任务，每批最多处理 BLOCK_SIZE = 16*16个高斯
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE) {
         // 检查该block内所有线程都已经完成渲染，则退出循环
-		int num_done = __syncthreads_count(done);   // 通过 __syncthreads_count统计已经完成渲染的线程数
+		int num_done = __syncthreads_count(done);   // 通过 __syncthreads_count 函数统计当前block内 done变为 true的线程个数，如果全部线程都完成，则跳出循环
 		if (num_done == BLOCK_SIZE)
 			break;
 
-        // 共同从全局显存读取 每一个高斯的数据到共享显存（已经结束的线程去取）
+        // 从全局显存中读取 每个高斯的数据到 当前block的共享显存（已经结束的线程去取）
 		int progress = i * BLOCK_SIZE + block.thread_rank();    // 当前处理的线程ID。block.thread_rank()：当前线程在该 block内的ID，区间为[0, 线程数)
         // 当前线程ID有效，即其处理的高斯不越界
 		if (range.x + progress < range.y)
@@ -408,10 +402,10 @@ renderCUDA(
             // 计算当前点的投影坐标与锥体参数的差值：
             // 计算当前点在屏幕上的坐标 xy 与当前像素坐标 pixf 的差值，并使用锥体参数计算 power。
 			float2 xy = collected_xy[j];    // 当前处理的2D高斯 中心的像素坐标
-			float2 d = { xy.x - pixf.x, xy.y - pixf.y };    // 当前处理的2D高斯 中心的像素坐标 到 当前处理的像素点 的 offset
+			float2 d = { xy.x - pixf.x, xy.y - pixf.y };    // 当前处理像素 到 2D高斯中心像素坐标的 位移向量
 			float4 con_o = collected_conic_opacity[j];          // 当前处理的高斯的 2D协方差矩阵的逆 和 不透明度，x、y、z: 分别是2D协方差逆矩阵的上半对角元素, w：不透明度
 
-            // 计算高斯分布概率的指数部分，用于确定像素在光栅化过程中的贡献程度
+            // 2D高斯分布的指数部分，-1/2 d^T Σ^-1 d，用于确定像素在光栅化过程中的贡献程度
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
@@ -465,10 +459,10 @@ void FORWARD::render(
 	const float2* means2D,  // 已计算的 所有高斯 中心在当前相机图像平面的二维坐标
 	const float* colors,    // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float4* conic_opacity,    // 已计算的 所有高斯 2D协方差矩阵的逆 和 不透明度
-	float* final_T,         // 输出的 渲染过程后每个像素 pixel的最终透明度或透射率值
-	uint32_t* n_contrib,    // 输出的 每个像素 pixel的最后一个贡献的高斯是谁
+	float* final_T,         // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
+	uint32_t* n_contrib,    // 输出的 对渲染每个像素 pixel的最后一个有贡献的 高斯ID 的数组
 	const float* bg_color,  // 背景颜色，默认为[1,1,1]，黑色
-	float* out_color)       // 输出的 RGB图像
+	float* out_color)       // 输出的 RGB图像（加上了背景颜色）
 {
     // 开始进入CUDA并行计算，将图像分为多个线程块（分配一个 进程）；每个线程块为每个像素分配一个线程；
     // 对于每个block只排序一次，认为block里面的pixel都被block中的所有gaussian影响且顺序一样。
@@ -504,7 +498,7 @@ void FORWARD::preprocess(
 	const glm::vec4* rotations, // 所有高斯的 旋转四元数
 	const float* opacities,     // 所有高斯的 不透明度
 	const float* shs,           // 所有高斯的 球谐系数
-	bool* clamped,              // geomState中记录高斯是否被裁剪的标志，即某位置为 True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
+	bool* clamped,              // 输出的 所有高斯 是否被裁剪的标志 数组，某位置为 True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
 	const float* cov3D_precomp, // 因预计算的3D协方差矩阵默认是空tensor，则传入的是一个 NULL指针
 	const float* colors_precomp,    // 因预计算的颜色默认是空tensor，则传入的是一个 NULL指针
 	const float* viewmatrix,    // 观测变换矩阵，W2C

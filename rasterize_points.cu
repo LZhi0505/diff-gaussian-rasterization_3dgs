@@ -40,7 +40,12 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) { //输入的�
 
 /**
  * 光栅化（前向传播）
- * @return: 一个元组，包含：渲染的高斯的个数 rendered、渲染的RGB图像 out_color、每个高斯在当前图像平面上的投影半径 radii、用于管理内存缓冲区的三个Tensor：geomBuffer、binningBuffer、imgBuffer
+ * @return: 一个元组，包含：   rendered：渲染的tile的个数
+ *                          out_color：渲染的RGB图像
+ *                          radii：每个高斯投影在当前相机图像平面上的最大半径 数组
+ *                          geomBuffer：所有高斯 几何数据的 tensor：包括2D中心像素坐标、相机坐标系下的深度、3D协方差矩阵等
+ *                          binningBuffer：存储所有高斯 排序数据的 tensor：包括未排序和排序后的 所有高斯覆盖的tile的 keys、values列表
+ *                          imgBuffer：存储所有高斯 渲染后数据的 tensor：包括累积的透射率、最后一个贡献的高斯ID
  */
 std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
@@ -84,15 +89,17 @@ RasterizeGaussiansCUDA(
   // 4. 创建用于管理内存分配的辅助函数
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
-  torch::Tensor geomBuffer = torch::empty({0}, options.device(device));         // 存储所有高斯的参数的 tensor：包括中心位置、缩放因子、旋转四元数、不透明度
-  torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
-  torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
+
+  torch::Tensor geomBuffer = torch::empty({0}, options.device(device));         // 存储所有高斯 几何数据的 tensor：包括2D中心像素坐标、相机坐标系下的深度、3D协方差矩阵等
+  torch::Tensor binningBuffer = torch::empty({0}, options.device(device));      // 存储所有高斯 排序数据的 tensor：包括未排序和排序后的 所有高斯覆盖的tile的 keys、values列表
+  torch::Tensor imgBuffer = torch::empty({0}, options.device(device));          // 存储所有高斯 渲染后数据的 tensor：包括累积的透射率、最后一个贡献的高斯ID
+
   // geomFunc、binningFunc、imgFunc 是三个函数指针，其指向的函数可以动态调整内存缓冲区的大小
   std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
   
-  int rendered = 0; // 初始化渲染的高斯个数为0
+  int rendered = 0; // 初始化渲染的tile个数为0
 
   if(P != 0) {
       // 场景中存在高斯，则进行光栅化
@@ -103,7 +110,10 @@ RasterizeGaussiansCUDA(
 		M = sh.size(1);
       }
 
-      //! 5. 实际可微光栅化的前向渲染，返回：渲染的高斯的个数 rendered、渲染的RGB图像 out_color、每个高斯在当前图像平面上的投影半径 radii、用于管理内存缓冲区的三个Tensor：geomBuffer、binningBuffer、imgBuffer
+      //! 5. 实际的前向传播：渲染
+      // 返回：所有高斯覆盖的 tile的总个数
+      // 输出：渲染的RGB图像 out_color、每个高斯投影在当前相机图像平面上的最大半径 radii
+      // 更新：用于管理内存缓冲区的三个Tensor：geomBuffer、binningBuffer、imgBuffer
 	  rendered = CudaRasterizer::Rasterizer::forward(
 	    geomFunc,   // 调整内存缓冲区的函数指针
 		binningFunc,
@@ -127,42 +137,48 @@ RasterizeGaussiansCUDA(
 		tan_fovx,
 		tan_fovy,
 		prefiltered,
-		out_color.contiguous().data<float>(),   // 输出的 颜色图像，(3,H,W)
-		radii.contiguous().data<int>(),         // 输出的 在图像平面上的投影半径(N,)
+		out_color.contiguous().data<float>(),   // 输出的 RGB图像，考虑了背景颜色，(3,H,W)
+		radii.contiguous().data<int>(),         // 输出的 所有高斯 投影在当前相机图像平面的最大半径 数组，(N,)
 		debug);
   }
 
   return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer);
 }
 
+
+/**
+ * 反向传播，求出
+ * @return: 一个元组，包含：  dL_dmeans2D：
+ */
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
- 	const torch::Tensor& background,
-	const torch::Tensor& means3D,
-	const torch::Tensor& radii,
-    const torch::Tensor& colors,
-	const torch::Tensor& scales,
-	const torch::Tensor& rotations,
-	const float scale_modifier,
-	const torch::Tensor& cov3D_precomp,
-	const torch::Tensor& viewmatrix,
-    const torch::Tensor& projmatrix,
+ 	const torch::Tensor& background,    // 背景颜色，默认为[1,1,1]，黑色
+	const torch::Tensor& means3D,   // 所有高斯 中心的世界坐标
+	const torch::Tensor& radii,     // 所有高斯 投影在当前相机图像平面上的最大半径
+    const torch::Tensor& colors,    // python代码中 预计算的颜色，默认是空tensor
+	const torch::Tensor& scales,    // 所有高斯的 缩放因子
+	const torch::Tensor& rotations, // 所有高斯的 旋转四元数
+	const float scale_modifier, // 缩放因子调节系数
+	const torch::Tensor& cov3D_precomp, // python代码中 预计算的3D协方差矩阵，默认为空tensor
+	const torch::Tensor& viewmatrix,    // 观测变换矩阵，W2C
+    const torch::Tensor& projmatrix,    // 观测变换*投影变换矩阵，W2NDC = W2C * C2NDC
 	const float tan_fovx,
 	const float tan_fovy,
-    const torch::Tensor& dL_dout_color,
-	const torch::Tensor& sh,
-	const int degree,
-	const torch::Tensor& campos,
-	const torch::Tensor& geomBuffer,
-	const int R,
-	const torch::Tensor& binningBuffer,
-	const torch::Tensor& imageBuffer,
-	const bool debug) 
+    const torch::Tensor& dL_dout_color, // loss对渲染的RGB图像中每个像素颜色的 梯度
+	const torch::Tensor& sh,    // 所有高斯的 球谐系数，(N,16,3)
+	const int degree,   // # 当前的球谐阶数
+	const torch::Tensor& campos,    // 当前相机中心的世界坐标
+	const torch::Tensor& geomBuffer,    // 存储所有高斯 几何数据的 tensor：包括2D中心像素坐标、相机坐标系下的深度、3D协方差矩阵等
+	const int R,        // 所有高斯覆盖的 tile的总个数
+	const torch::Tensor& binningBuffer, // 存储所有高斯 排序数据的 tensor：包括未排序和排序后的 所有高斯覆盖的tile的 keys、values列表
+	const torch::Tensor& imageBuffer,   // 存储所有高斯 渲染后数据的 tensor：包括累积的透射率、最后一个贡献的高斯ID
+	const bool debug)   // 默认为False
 {
-  const int P = means3D.size(0);
-  const int H = dL_dout_color.size(1);
-  const int W = dL_dout_color.size(2);
-  
+  const int P = means3D.size(0);    // 所有高斯的个数
+  const int H = dL_dout_color.size(1);  // 图像高
+  const int W = dL_dout_color.size(2);  // 图像宽
+
+  // 如果参数中输入了所有高斯的球谐系数，则 M=每个高斯的球谐系数个数=16；否则 M=0
   int M = 0;
   if(sh.size(0) != 0)
   {	
@@ -179,8 +195,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dscales = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_drotations = torch::zeros({P, 4}, means3D.options());
   
-  if(P != 0)
-  {  
+  if(P != 0) {
+      // 场景中存在高斯，则进行反向传播
+      //! 实际反向传播
 	  CudaRasterizer::Rasterizer::backward(P, degree, M, R,
 	  background.contiguous().data<float>(),
 	  W, H, 
@@ -200,7 +217,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
-	  dL_dout_color.contiguous().data<float>(),
+	  dL_dout_color.contiguous().data<float>(),     // 输入的 loss对渲染的每个像素颜色的 梯度
 	  dL_dmeans2D.contiguous().data<float>(),
 	  dL_dconic.contiguous().data<float>(),  
 	  dL_dopacity.contiguous().data<float>(),
