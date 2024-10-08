@@ -97,16 +97,14 @@ __global__ void checkFrustum(
 
 /**
  * 为每个高斯覆盖的所有 tile生成用于排序的 key-value，以便在后续操作中按深度对高斯进行排序
- * key：     uint64_t，前32位，其该高斯覆盖的每个tile 的ID，后32位，该高斯的 depth
- * value:   该高斯的 ID
  */
 __global__ void duplicateWithKeys(
 	int P,      // 所有高斯的个数
 	const float2* points_xy,    // 预处理计算的 所有高斯 中心在当前相机图像平面的二维坐标 数组
-	const float* depths,        // 预处理计算的 所有高斯 中心在当前相机坐标系下的z值（深度） 数组
+	const float* depths,        // 预处理计算的 所有高斯 中心在当前相机坐标系下的z值（深度）数组
 	const uint32_t* offsets,    // 所有高斯 覆盖的 tile个数的 前缀和 数组
-	uint64_t* gaussian_keys_unsorted,   // 输出的 遍历所有高斯生成它们覆盖的tile的 且 未排序的 keys 列表
-	uint32_t* gaussian_values_unsorted, // 输出的 遍历所有高斯生成它们覆盖的tile的 且 未排序的 values 列表
+	uint64_t* gaussian_keys_unsorted,   // 输出的 遍历所有高斯生成它们覆盖的tile的 且 未排序的 keys 列表。每个元素64bit，高32位存某高斯覆盖的tile_ID，低32位存某高斯中心在相机坐标系下的z（深度）值
+	uint32_t* gaussian_values_unsorted, // 输出的 遍历所有高斯生成它们覆盖的tile的 且 未排序的 values 列表。每个元素是 某高斯的ID
 	int* radii,     // 预处理计算的 所有高斯 投影在当前相机图像平面的最大半径 数组
 	dim3 grid)      // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
 {
@@ -124,7 +122,7 @@ __global__ void duplicateWithKeys(
 		uint2 rect_min, rect_max;
 		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
 
-        // 遍历该高斯 覆盖的每个 tile，为其生成一个 key-value
+        // 遍历该高斯 覆盖的每个 tile，为其生成一个 key-value：tile_ID|高斯深度 - 该高斯的ID
 		for (int y = rect_min.y; y < rect_max.y; y++)
 		{
 			for (int x = rect_min.x; x < rect_max.x; x++)
@@ -259,6 +257,9 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
 
 /**
  * 高斯的可微光栅化的前向渲染处理，可当作 main 函数
+ * 1: 分配 (p+255/256)个 block，每个 block有 256个 thread，对每个高斯做 preprocessCUDA();
+ * 2: 生成 buffer并对高斯做排序；
+ * 3: 分配 num_tiles个 block，每个 block有 256个 thread，对每个 pixel做渲染
  */
 int CudaRasterizer::Rasterizer::forward(
 	std::function<char* (size_t)> geometryBuffer,   // 三个都是调整内存缓冲区的函数指针
@@ -300,9 +301,9 @@ int CudaRasterizer::Rasterizer::forward(
 		radii = geomState.internal_radii;
 	}
 
-    // 3. 定义一个 tile_grid的维度，即在水平和垂直方向上需要多少个线程块来覆盖整个渲染区域，(W/16，H/16)
+    // 3. 定义一个 tile_grid的维度，即在水平和垂直方向上需要多少个线程块 block来覆盖整个渲染区域，(W/16，H/16)
 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
-    // 定义一个 block的维度，即在水平和垂直方向上的线程数。每个线程处理一个像素，则每个线程块处理16*16个像素，(16, 16, 1)
+    // 定义一个 block的维度，即在水平和垂直方向上的线程 thread个数。每个线程处理一个像素，则每个block处理16*16个像素，(16, 16, 1)
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
 
 	// 4. 为 ImageState分配显存，每个像素都有一个 ImageState数据
@@ -314,7 +315,11 @@ int CudaRasterizer::Rasterizer::forward(
 		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
 	}
 
-    //! 5. 预处理和投影：将每个高斯投影到图像平面上、计算投影所占的tile块坐标和个数、根据球谐系数计算RGB值。 具体实现在 forward.cu/preprocessCUDA
+    //! 5. 预处理和投影。具体实现在 forward.cu/preprocessCUDA
+    // 1. 将每个高斯投影到图像平面上，计算2D协方差矩阵、投影半径 radii；
+    // 2. 计算投影所占的tile块坐标和个数 tile tiles_touched；
+    // 3. 如果用球谐系数，将其转换成RGB；
+    // 4. 记录高斯的像素坐标 points_xy_image
 	CHECK_CUDA(FORWARD::preprocess(
 		P, D, M,
 		means3D,
@@ -364,14 +369,15 @@ int CudaRasterizer::Rasterizer::forward(
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
-    // 遍历每个高斯，记录其落在的 tile ID 与 深度
-	// 对于每个要渲染的高斯, 为其覆盖的所有tile生成排序所用的 key-value，其中，key：[tile ID | 3D高斯的深度]；value：[对应3D高斯的 ID]
+    // 对于每个要渲染的高斯，遍历其覆盖的tile，生成排序前的keys列表和values列表
+    // point_list_keys_unsorted: 未排序的keys列表，分布顺序：大顺序：各高斯，小顺序：该高斯覆盖的各tile_ID。每个元素64bit，高32位存某高斯覆盖的tile_ID，低32位存某高斯中心在相机坐标系下的z（深度）值，即(tile_ID | 3D高斯的深度)
+    // point_list_unsorted: 未排序的values列表，每个元素是 对应高斯的ID
 	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
 		P,
 		geomState.means2D,  // 预处理计算的 所有高斯 中心在当前相机图像平面的二维坐标 数组
 		geomState.depths,   // 预处理计算的 所有高斯 中心在当前相机坐标系下的z值（深度） 数组
 		geomState.point_offsets,    // 所有高斯覆盖的 tile个数的 前缀和
-		binningState.point_list_keys_unsorted,  // 输出的 遍历所有高斯生成它们覆盖的tile的 且 未排序的 keys 列表（uint64_t）
+		binningState.point_list_keys_unsorted,  // 输出的 遍历所有高斯生成它们覆盖的tile的 且 未排序的 keys 列表
 		binningState.point_list_unsorted,       // 输出的 遍历所有高斯生成它们覆盖的tile的 且 未排序的 values 列表
 		radii,          // 预处理计算的 所有高斯 投影在当前相机图像平面的最大半径 数组
 		tile_grid)      // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
@@ -381,14 +387,16 @@ int CudaRasterizer::Rasterizer::forward(
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
 
 
-    // 遍历每个 tile，根据落在其上的高斯的深度 进行升序排序
-    // 按 key的大小 对（keys [tile ID | 3D高斯的深度], values [高斯ID]）进行稳定的、并行、基数 升序排序：每个 tile对应的多个高斯按深度升序排放在一起
+    // 对于每个tile，遍历落在其上的高斯，按各高斯的深度升序排序，生成排序后的keys列表和values列表
+    // 按 key的大小，即tile_ID和3D高斯的深度，对 keys、values列表进行稳定的、并行、基数 升序排序
+    // point_list_keys：排序后的keys列表，分布顺序：大顺序：各tile_ID，小顺序：落在该tile内各高斯的深度
+    // point_list: 排序后的values列表
 	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
 		binningState.list_sorting_space,    // 排序时用到的临时显存空间
 		binningState.sorting_size,                     // 临时显存空间的大小
-		binningState.point_list_keys_unsorted,  // 未排序的 每个高斯覆盖的所有 tile的 keys列表，[tile ID | 3D高斯的深度]
-        binningState.point_list_keys,           // 排序后的 keys列表
-		binningState.point_list_unsorted,   // 未排序的 每个高斯覆盖的所有 tile的 values列表，[对应3D高斯的 ID]
+		binningState.point_list_keys_unsorted,  // 未排序的 每个高斯覆盖的所有 tile的 keys列表。 大顺序：各高斯，小顺序：该高斯覆盖的各tile_ID
+        binningState.point_list_keys,           // 排序后的 keys列表。                       大顺序：各tile_ID，小顺序：落在该tile内各高斯的深度
+		binningState.point_list_unsorted,   // 未排序的 每个高斯覆盖的所有 tile的 values列表。每个元素是[对应3D高斯的 ID]
         binningState.point_list,            // 排序后的 values列表
 		num_rendered,   // 要排序的 tile总个数，即所有高斯 投影到二维图像平面上覆盖的 tile的总个数
         0,      // 指定时从最低位开始
@@ -404,11 +412,11 @@ int CudaRasterizer::Rasterizer::forward(
 		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
 			num_rendered,       // 排序的 tile总个数，即所有高斯 投影到二维图像平面上覆盖的 tile的总个数
 			binningState.point_list_keys,   // 根据tile ID和高斯深度排序后的 keys列表
-			imgState.ranges);   // 输出的 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数表示多少个高斯落在该tile内
+			imgState.ranges);   // 输出的 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数
 	CHECK_CUDA(, debug)
 
 
-    // 每个 tile并行地 blending涉及的高斯
+    // 每个tile并行地 α-blending 触及的高斯
     // 如果传入的预计算的颜色 不是空指针，则是预计算的颜色
     //                    是空指针，则是预处理中 计算的 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
@@ -419,7 +427,7 @@ int CudaRasterizer::Rasterizer::forward(
 		tile_grid,     // 定义的CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数，(W/16，H/16)
         block,              // 定义的线程块 block的维度，(16, 16, 1)
 		imgState.ranges,    // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数表示多少个高斯落在该tile内
-		binningState.point_list,    // 按 tile ID、高斯深度 排序后的 高斯ID 列表
+		binningState.point_list,    // 按 tile ID、高斯深度 排序后的 values列表，即 高斯ID 列表
 		width, height,
 		geomState.means2D,  // 已计算的 所有高斯 中心在当前相机图像平面的二维坐标 数组
 		feature_ptr,        // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组

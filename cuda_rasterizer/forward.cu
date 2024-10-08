@@ -273,12 +273,12 @@ __global__ void preprocessCUDA(
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
 
     // 5. 计算2D协方差矩阵的 逆，用于EWA滤波算法
-	float det = (cov.x * cov.z - cov.y * cov.y);    // 2x2方阵 abbc的行列式 = ac - b^2
+	float det = (cov.x * cov.z - cov.y * cov.y);    // 2x2方阵 xyyz的行列式 = xz - y^2
 	if (det == 0.0f)
         // 行列式为0，该矩阵 不可逆，则直接返回
 		return;
 	float det_inv = 1.f / det;
-    // 2D协方差矩阵的逆（也只存了上半角元素，2x2的矩阵的取逆是 主对角线取反，次对角线取负，再除以行列式）
+    // 2D协方差矩阵的逆（也只存了上半角元素，2x2的矩阵的取逆是 主对角线对换，次对角线取负，再除以行列式）
 	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };  // 取逆
 
     // 6. 计算该3D高斯投影在屏幕平面上的、扩展后的 投影圆所在的矩形框边界，最后再转换为 线程块的坐标。如果矩形覆盖0个tile，则退出
@@ -329,13 +329,13 @@ template <uint32_t CHANNELS>    // CHANNELS = 3，即RGB三个通道
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)    // CUDA 启动核函数时使用的线程格和线程块的数量
 renderCUDA(
 	const uint2* __restrict__ ranges,   // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数表示多少个高斯落在该tile内
-	const uint32_t* __restrict__ point_list,    // 按 tile ID、高斯深度 排序后的 高斯ID列表
+	const uint32_t* __restrict__ point_list,    // 按 tile ID、高斯深度 排序后的 values列表，即 高斯ID 列表
 	int W, int H,
 	const float2* __restrict__ points_xy_image, // 所有高斯 中心在当前相机图像平面的二维坐标 的数组
 	const float* __restrict__ features,         // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float4* __restrict__ conic_opacity,   // 所有高斯 2D协方差矩阵的逆 和 不透明度 的数组
-	float* __restrict__ final_T,                // 输出的 渲染过程后每个像素 pixel的最终透明度或透射率值 的数组
-	uint32_t* __restrict__ n_contrib,           // 输出的 每个像素 pixel的最后一个贡献的高斯 的数组（？多少个高斯对该像素有贡献）
+	float* __restrict__ final_T,                // 输出的 渲染后每个像素 pixel的 累积的透射率
+	uint32_t* __restrict__ n_contrib,           // 输出的 对渲染每个像素 pixel的最后一个有贡献的 高斯ID
 	const float* __restrict__ bg_color,         // 提供的背景颜色，默认为[1,1,1]，黑色
 	float* __restrict__ out_color)              // 输出的 RGB图像
 {
@@ -354,22 +354,22 @@ renderCUDA(
     uint32_t pix_id = W * pix.y + pix.x;        // 当前处理的 像素 在像素平面的　索引
 	float2 pixf = { (float)pix.x, (float)pix.y };   // 当前处理的 像素 在像素平面的坐标
 
-    // 2. 判断当前线程处理的　像素　是否在图像有效像素范围内
+    // 2. 判断当前线程处理的 像素 是否在图像有效像素范围内
 	bool inside = pix.x < W　&& pix.y < H;
     // 如果不在，则将 done设为 true，表示该线程无需执行渲染操作
 	bool done = !inside;
 
-    // 3. 加载点云数据处理范围
-    // 根据当前处理的 tile ID 获取该 tile在排序后的 keys列表中的起始、终止位置
+    // 3. 计算当前tile触及的高斯个数，太多，则分rounds批渲染
+    // 根据当前处理的 tile_ID，获取该tile在排序后的keys列表中的起始、终止位置，[x,y)。个数y-x：投影到该tile上的高斯的个数
 	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
-    // 将渲染任务分成 rounds批，每一批处理 BLOCK_SIZE = 16*16个高斯
-	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE); // 高斯个数过多，则分批处理，每批最多处理 BLOCK_SIZE=16*16个高斯
 	int toDo = range.y - range.x;   // 投影到该tile上的 高斯的个数
 
     // 4. 初始化同一block中的各线程共享的显存，分别定义三个共享显存数组，用于在每个block内共享数据
-	__shared__ int collected_id[BLOCK_SIZE];        // 记录各线程处理的高斯球的编号
-	__shared__ float2 collected_xy[BLOCK_SIZE];     // 记录各线程处理的高斯球中心在2d平面的投影坐标
-	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];  // 记录各线程处理的高斯球的2d协方差矩阵的逆和不透明度
+	__shared__ int collected_id[BLOCK_SIZE];        // 记录各线程处理的 高斯的ID
+	__shared__ float2 collected_xy[BLOCK_SIZE];     // 记录各线程处理的高斯 中心在2D平面的 像素坐标
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];  // 记录各线程处理的高斯的2D协方差矩阵的 逆 和 不透明度
 
     // 5. 初始化渲染相关变量，包括当前像素颜色 C、贡献者数量
 	float T = 1.0f;     // 透射率
@@ -377,87 +377,80 @@ renderCUDA(
 	uint32_t last_contributor = 0;  // 存储最终经过的高斯球数量
 	float C[CHANNELS] = { 0 };      // 最后渲染的颜色
 
-    // 6. 遍历每批任务，任务一批处理 BLOCK_SIZE = 16*16个高斯，内部循环迭代高斯，进行基于锥体参数的渲染计算，并更新颜色信息
+    // 6. 外循环：迭代分批渲染任务，每批最多处理 BLOCK_SIZE = 16*16个高斯
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE) {
-        // 使用 rounds 控制循环的迭代次数，每次迭代处理一批点云数据
-
         // 检查该block内所有线程都已经完成渲染，则退出循环
 		int num_done = __syncthreads_count(done);   // 通过 __syncthreads_count统计已经完成渲染的线程数
 		if (num_done == BLOCK_SIZE)
 			break;
 
-        // 共同从全局显存读取 每一个高斯的数据到共享显存（已经结束的线程去取），block.thread_rank()：当前线程在该 block内的ID，区间为[0, 线程数)
-		int progress = i * BLOCK_SIZE + block.thread_rank();
-        // 如果当前线程有效，即处理的高斯不越界
+        // 共同从全局显存读取 每一个高斯的数据到共享显存（已经结束的线程去取）
+		int progress = i * BLOCK_SIZE + block.thread_rank();    // 当前处理的线程ID。block.thread_rank()：当前线程在该 block内的ID，区间为[0, 线程数)
+        // 当前线程ID有效，即其处理的高斯不越界
 		if (range.x + progress < range.y)
 		{
-            // 当前处理的高斯的ID
+            // 当前线程处理的高斯的ID
 			int coll_id = point_list[range.x + progress];
 
             collected_id[block.thread_rank()] = coll_id;    // 当前线程处理的高斯ID
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];   // 当前线程处理的高斯 中心在当前相机图像平面的像素坐标
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];  // 当前线程处理的高斯 2D协方差矩阵的逆 和 不透明度
 		}
-		block.sync();   // 确保所有线程都加载完成
+		block.sync();   // 迭代每个高斯后，同步当前block下的所有线程
 
-        // 每个线程遍历当前batch的高斯
+
+        // 内循环：每个线程遍历当前block处理的tile触及的 当前批次的 所有高斯，进行基于锥体参数的渲染计算，并更新颜色信息
 		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++) {
-            //在当前批次的循环中，每个线程处理一条点云数据
-			// Keep track of current position in range
-			contributor++;
 
-			// Resample using conic matrix (cf. "Surface 
-			// Splatting" by Zwicker et al., 2001)
+			contributor++;  // 对渲染当前像素RGB值有贡献的高斯的个数
+
+			// Resample using conic matrix (cf. "Surface Splatting" by Zwicker et al., 2001)
             // 计算当前点的投影坐标与锥体参数的差值：
             // 计算当前点在屏幕上的坐标 xy 与当前像素坐标 pixf 的差值，并使用锥体参数计算 power。
-            // Resample using conic matrix (cf. "Surface
 			float2 xy = collected_xy[j];    // 当前处理的2D高斯 中心的像素坐标
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };    // 当前处理的2D高斯 中心的像素坐标 到 当前处理的像素点 的 offset
-			float4 con_o = collected_conic_opacity[j];              // 当前处理的高斯的 2D协方差矩阵的逆 和 不透明度
+			float4 con_o = collected_conic_opacity[j];          // 当前处理的高斯的 2D协方差矩阵的逆 和 不透明度，x、y、z: 分别是2D协方差逆矩阵的上半对角元素, w：不透明度
 
             // 计算高斯分布概率的指数部分，用于确定像素在光栅化过程中的贡献程度
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
 
-			// Eq. (2) from 3D Gaussian splatting paper.
-            // 通过与高斯的不透明度相乘获得alpha值及其从平均值开始的指数衰减。避免数值不稳定性
-			// Obtain alpha by multiplying with Gaussian opacity and its exponential falloff from mean.
-			// Avoid numerical instabilities (see paper appendix).
-            // 计算论文中公式2的 alpha
-			float alpha = min(0.99f, con_o.w * exp(power)); // opacity * 像素点出现在这个高斯的概率 计算 alpha值
+            // 通过相乘 高斯的不透明度 及其 从均值的指数下降 来计算3DGS论文公式(2)中的α值，避免数值不稳定性
+			float alpha = min(0.99f, con_o.w * exp(power));
 
             if (alpha < 1.0f / 255.0f)
-                // 太小了就当成透明的
+                // α太小，就将该高斯当作透明的
 				continue;
 
-            // 由alpha计算透射率
+            // 计算透射率：累乘 a
             float test_T = T * (1 - alpha);
-            // 透射率 < 极小值，标记这个像素的渲染结束
+            // 透射率 < 极小值，即不透明度接近 1，标记这个像素的渲染结束，不进行后续渲染
 			if (test_T < 0.0001f) {
 				done = true;
 				continue;
 			}
 
-			// Eq. (3) from 3D Gaussian splatting paper.
-            // 通过 alpha-blending计算颜色 C，3个通道
+            // 通过 a-blending 计算当前像素的RGB三通道 颜色值 C。3DGS论文公式(3)
 			for (int ch = 0; ch < CHANNELS; ch++)
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T; // 每个通道的值是 累加 当前像素触及到的高斯 在当前相机中心的观测方向下 的RGB值 * a * 透射率T
 
 			T = test_T;
 
-			// Keep track of last range entry to update this pixel.
+            // 记录最后一个对渲染当前像素RGB值 有贡献的高斯ID
 			last_contributor = contributor;
 		}
 	}
 
     // 7. 写入最终渲染结果
-    // 所有处理有效像素的 thread都会将其最终渲染数据写入帧缓冲区和辅助缓冲区
 	if (inside) {
         // 所有处理有效像素的 thread都会将其最终的渲染数据 写入帧缓冲区和辅助缓冲区
-		final_T[pix_id] = T;    // 输出的 最终pix_id像素点的透射率
-		n_contrib[pix_id] = last_contributor;   // 输出的 贡献的高斯个数（？最后一个贡献的2D gaussian是谁）
-		for (int ch = 0; ch < CHANNELS; ch++)
+        // 输出的 渲染像素pix_id的颜色过程中 累积的透射率
+        final_T[pix_id] = T;
+        // 输出的 渲染像素pix_id的颜色过程中 最后一个有贡献的高斯ID
+		n_contrib[pix_id] = last_contributor;
+		// 最后输出的RGB颜色值 加上 背景颜色
+        for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 	}
 }
@@ -467,7 +460,7 @@ void FORWARD::render(
 	const dim3 grid,    // 定义的CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数，(W/16，H/16)
     dim3 block,         // 定义的线程块 block的维度，(16, 16, 1)
 	const uint2* ranges,        // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数表示多少个高斯落在该tile内
-	const uint32_t* point_list, // 按 tile ID、高斯深度 排序后的 高斯ID 列表
+	const uint32_t* point_list, // 按 tile ID、高斯深度 排序后的 values列表，即 高斯ID 列表
 	int W, int H,
 	const float2* means2D,  // 已计算的 所有高斯 中心在当前相机图像平面的二维坐标
 	const float* colors,    // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
@@ -496,8 +489,10 @@ void FORWARD::render(
 
 /**
  * 调用CUDA核函数 preprocessCUDA对每个高斯进行预处理和投影
- * (1) 计算高斯投影到图像平面的最大半径 radii
- * (2) 计算投影椭圆涉及到的tile的坐标和个数，以高效渲染
+ * 1. 将每个高斯投影到图像平面上，计算2D协方差矩阵、投影半径 radii；
+ * 2. 计算投影所占的tile块坐标和个数 tile tiles_touched；
+ * 3. 如果用球谐系数，将其转换成RGB；
+ * 4. 记录高斯的像素坐标 points_xy_image
  */
 void FORWARD::preprocess(
     int P,      // 所有高斯的个数
