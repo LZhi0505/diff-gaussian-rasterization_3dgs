@@ -370,8 +370,8 @@ int CudaRasterizer::Rasterizer::forward(
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
     // 生成排序列表：对于每个要渲染的高斯，遍历其覆盖的tile，生成排序前的keys列表和values列表
-    // point_list_keys_unsorted: 未排序的keys列表，分布顺序：大顺序：各高斯，小顺序：该高斯覆盖的各tile_ID。每个元素64bit，高32位存某高斯覆盖的tile_ID，低32位存某高斯中心在相机坐标系下的z（深度）值，即(tile_ID | 3D高斯的深度)
-    // point_list_unsorted: 未排序的values列表，每个元素是 对应高斯的ID
+    // point_list_keys_unsorted:    未排序的keys列表，分布顺序：大顺序：各高斯，小顺序：该高斯覆盖的各tile_ID。每个元素64bit，高32位存某高斯覆盖的tile_ID，低32位存某高斯中心在相机坐标系下的z（深度）值，即(tile_ID | 3D高斯的深度)
+    // point_list_unsorted:         未排序的values列表，每个元素是 对应高斯的ID
 	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
 		P,
 		geomState.means2D,  // 预处理计算的 所有高斯 中心在当前相机图像平面的二维坐标 数组
@@ -389,8 +389,8 @@ int CudaRasterizer::Rasterizer::forward(
 
     // 排序：对于每个tile，遍历落在其上的高斯，按各高斯的深度升序排序，生成排序后的keys列表和values列表
     // 按 key的大小，即tile_ID和3D高斯的深度，对 keys、values列表进行稳定的、并行、基数 升序排序
-    // point_list_keys：排序后的keys列表，分布顺序：大顺序：各tile_ID，小顺序：落在该tile内各高斯的深度
-    // point_list: 排序后的values列表
+    // point_list_keys: 排序后的keys列表，分布顺序：大顺序：各tile_ID，小顺序：落在该tile内各高斯的深度
+    // point_list:      排序后的values列表
 	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
 		binningState.list_sorting_space,    // 排序时用到的临时显存空间
 		binningState.sorting_size,                     // 临时显存空间的大小
@@ -412,7 +412,7 @@ int CudaRasterizer::Rasterizer::forward(
 		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
 			num_rendered,       // 排序的 tile总个数，即所有高斯 投影到二维图像平面上覆盖的 tile的总个数
 			binningState.point_list_keys,   // 根据tile ID和高斯深度排序后的 keys列表
-			imgState.ranges);   // 输出的 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数
+			imgState.ranges);   // 输出的 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 	CHECK_CUDA(, debug)
 
     // 如果传入的预计算的颜色 不是空指针，则是预计算的颜色
@@ -423,7 +423,7 @@ int CudaRasterizer::Rasterizer::forward(
 	CHECK_CUDA(FORWARD::render(
 		tile_grid,     // 定义的CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数，(W/16，H/16)
         block,              // 定义的线程块 block的维度，(16, 16, 1)
-		imgState.ranges,    // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数y-x表示多少个高斯落在该tile内
+		imgState.ranges,    // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 		binningState.point_list,    // 按 tile ID、高斯深度 排序后的 values列表，即 高斯ID 列表
 		width, height,
 		geomState.means2D,  // 已计算的 所有高斯 中心在当前相机图像平面的二维坐标 数组

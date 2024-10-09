@@ -322,7 +322,7 @@ __global__ void preprocessCUDA(
 template <uint32_t CHANNELS>    // CHANNELS = 3，即RGB三个通道
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)    // CUDA 启动核函数时使用的线程格和线程块的数量
 renderCUDA(
-	const uint2* __restrict__ ranges,   // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数表示多少个高斯落在该tile内
+	const uint2* __restrict__ ranges,   // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 	const uint32_t* __restrict__ point_list,    // 按 tile ID、高斯深度 排序后的 values列表，即 高斯ID 列表
 	int W, int H,
 	const float2* __restrict__ points_xy_image, // 所有高斯 中心在当前相机图像平面的二维坐标 的数组
@@ -354,11 +354,12 @@ renderCUDA(
 	bool done = !inside;
 
     // 3. 计算当前tile触及的高斯个数，太多，则分rounds批渲染
-    // 根据当前处理的 tile_ID，获取该tile在排序后的keys列表中的起始、终止位置，[x,y)。个数y-x：投影到该tile上的高斯的个数
+    // 根据当前处理的 tile_ID，获取该tile在排序后的keys列表中的起始、终止位置，[x,y)。个数y-x：投影到该tile上的高斯的个数。
+    // 也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
 
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE); // 高斯个数过多，则分批处理，每批最多处理 BLOCK_SIZE=16*16个高斯
-	int toDo = range.y - range.x;   // 投影到该tile上的 高斯的个数
+	int toDo = range.y - range.x;   // 当前tile还未处理的 高斯的个数
 
     // 4. 初始化同一block中的各线程共享的显存，分别定义三个共享显存数组，用于在每个block内共享数据
 	__shared__ int collected_id[BLOCK_SIZE];        // 记录各线程处理的 高斯的ID
@@ -453,7 +454,7 @@ renderCUDA(
 void FORWARD::render(
 	const dim3 grid,    // 定义的CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数，(W/16，H/16)
     dim3 block,         // 定义的线程块 block的维度，(16, 16, 1)
-	const uint2* ranges,        // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数表示多少个高斯落在该tile内
+	const uint2* ranges,        // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 	const uint32_t* point_list, // 按 tile ID、高斯深度 排序后的 values列表，即 高斯ID 列表
 	int W, int H,
 	const float2* means2D,  // 已计算的 所有高斯 中心在当前相机图像平面的二维坐标
@@ -526,6 +527,7 @@ void FORWARD::preprocess(
      *
      * 线程ID：在CUDA核函数中，每个线程都会被分配一个唯一的线程ID。这个ID用于区分同一个核函数中不同的执行线程，使得每个线程可以处理数据的不同部分。例如，在处理数组时，线程ID可以用来确定每个线程负责处理数组中的哪个元素。
      * 获取线程ID：线程ID可以通过核函数的内置变量threadIdx来获取。在一维配置中，threadIdx.x表示当前线程的ID。如果使用二维或三维的块配置，还可以使用threadIdx.y和threadIdx.z。
+     * 分成 (P+255)/256个block，每个block 256个thread
      */
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,

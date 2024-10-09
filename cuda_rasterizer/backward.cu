@@ -384,6 +384,8 @@ __global__ void preprocessCUDA(
 	float4 m_hom = transformPoint4x4(m, proj);
 	float m_w = 1.0f / (m_hom.w + 0.0000001f);
 
+    // 这里的xyz得先变换到相机系哈,再按照上面的公式计算;
+
 	// Compute loss gradient w.r.t. 3D means due to gradients of 2D means
 	// from rendering procedure
 	glm::vec3 dL_dmean;
