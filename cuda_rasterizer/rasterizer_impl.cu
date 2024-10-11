@@ -227,7 +227,7 @@ CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, s
 {
 	ImageState img;
 	obtain(chunk, img.accum_alpha, N, 128); // 渲染后每个像素 pixel的 累积的透射率 的数组
-	obtain(chunk, img.n_contrib, N, 128);   // 对渲染每个像素 pixel的最后一个有贡献的 高斯ID 的数组
+	obtain(chunk, img.n_contrib, N, 128);   // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 	obtain(chunk, img.ranges, N, 128);      // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数
 	return img;
 }
@@ -427,10 +427,10 @@ int CudaRasterizer::Rasterizer::forward(
 		binningState.point_list,    // 按 tile ID、高斯深度 排序后的 values列表，即 高斯ID 列表
 		width, height,
 		geomState.means2D,  // 已计算的 所有高斯 中心在当前相机图像平面的二维坐标 数组
-		feature_ptr,        // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组（每个高斯在当前观测方向下只有一个颜色）
+		feature_ptr,        // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组（每个高斯在当前观测方向下只有一个颜色，仅颜色强度分布不同）
 		geomState.conic_opacity,    // 已计算的 所有高斯 2D协方差矩阵的逆 和 不透明度 数组
 		imgState.accum_alpha,   // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
-		imgState.n_contrib,     // 输出的 对渲染每个像素 pixel的最后一个有贡献的 高斯ID 的数组
+		imgState.n_contrib,     // 输出的 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 		background,     // 背景颜色，默认为[1,1,1]，黑色
 		out_color               // 输出的 RGB图像（加上了背景颜色）
         ), debug)

@@ -54,7 +54,7 @@ namespace CudaRasterizer
 	struct ImageState
 	{
 		uint2* ranges;  // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数
-		uint32_t* n_contrib;    // 对渲染每个像素 pixel的最后一个有贡献的 高斯ID 的数组
+		uint32_t* n_contrib;    // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 		float* accum_alpha;     // 渲染后每个像素 pixel的 累积的透射率 的数组
 
 		static ImageState fromChunk(char*& chunk, size_t N);

@@ -329,7 +329,7 @@ renderCUDA(
 	const float* __restrict__ features,         // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float4* __restrict__ conic_opacity,   // 所有高斯 2D协方差矩阵的逆 和 不透明度 的数组
 	float* __restrict__ final_T,                // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
-	uint32_t* __restrict__ n_contrib,           // 输出的 对渲染每个像素 pixel的最后一个有贡献的 高斯ID 的数组
+	uint32_t* __restrict__ n_contrib,           // 输出的 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 	const float* __restrict__ bg_color,         // 提供的背景颜色，默认为[1,1,1]，黑色
 	float* __restrict__ out_color)              // 输出的 RGB图像（加上了背景颜色）
 {
@@ -368,7 +368,7 @@ renderCUDA(
 
     // 5. 初始化渲染相关变量，包括当前像素颜色 C、贡献者数量
 	float T = 1.0f;     // 透射率
-	uint32_t contributor = 0;       // 计算该像素经过了多少个高斯
+	uint32_t contributor = 0;       // 计算该像素经过了多少个高斯，也是最后一个对渲染当前像素RGB值 有贡献的高斯ID
 	uint32_t last_contributor = 0;  // 存储最终经过的高斯球数量
 	float C[CHANNELS] = { 0 };      // 最后渲染的颜色
 
@@ -432,7 +432,7 @@ renderCUDA(
 
 			T = test_T;
 
-            // 记录最后一个对渲染当前像素RGB值 有贡献的高斯ID
+            // 记录 渲染当前像素射线 穿过的高斯的个数，也是最后一个对渲染当前像素RGB值 有贡献的高斯ID
 			last_contributor = contributor;
 		}
 	}
@@ -442,7 +442,7 @@ renderCUDA(
         // 所有处理有效像素的 thread都会将其最终的渲染数据 写入帧缓冲区和辅助缓冲区
         // 输出的 渲染像素pix_id的颜色过程中 累积的透射率
         final_T[pix_id] = T;
-        // 输出的 渲染像素pix_id的颜色过程中 最后一个有贡献的高斯ID
+        // 输出的 渲染像素pix_id的颜色过程中 穿过的高斯的个数，也是最后一个对渲染当前像素RGB值 有贡献的高斯ID最后一个有贡献的高斯ID
 		n_contrib[pix_id] = last_contributor;
 		// 最后输出的RGB颜色值 加上 背景颜色
         for (int ch = 0; ch < CHANNELS; ch++)
@@ -461,7 +461,7 @@ void FORWARD::render(
 	const float* colors,    // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float4* conic_opacity,    // 已计算的 所有高斯 2D协方差矩阵的逆 和 不透明度
 	float* final_T,         // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
-	uint32_t* n_contrib,    // 输出的 对渲染每个像素 pixel的最后一个有贡献的 高斯ID 的数组
+	uint32_t* n_contrib,    // 输出的 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 	const float* bg_color,  // 背景颜色，默认为[1,1,1]，黑色
 	float* out_color)       // 输出的 RGB图像（加上了背景颜色）
 {
