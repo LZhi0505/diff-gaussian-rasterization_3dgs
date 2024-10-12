@@ -367,7 +367,7 @@ renderCUDA(
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];  // 记录各线程处理的高斯的2D协方差矩阵的 逆 和 不透明度
 
     // 5. 初始化渲染相关变量，包括当前像素颜色 C、贡献者数量
-	float T = 1.0f;     // 透射率
+	float T = 1.0f;     // 透射率：光线经过高斯后 剩余的能量。初值设为 1
 	uint32_t contributor = 0;       // 计算该像素经过了多少个高斯，也是最后一个对渲染当前像素RGB值 有贡献的高斯ID
 	uint32_t last_contributor = 0;  // 存储最终经过的高斯球数量
 	float C[CHANNELS] = { 0 };      // 最后渲染的颜色
@@ -400,8 +400,7 @@ renderCUDA(
 			contributor++;  // 对渲染当前像素RGB值有贡献的高斯的个数
 
 			// Resample using conic matrix (cf. "Surface Splatting" by Zwicker et al., 2001)
-            // 计算当前点的投影坐标与锥体参数的差值：
-            // 计算当前点在屏幕上的坐标 xy 与当前像素坐标 pixf 的差值，并使用锥体参数计算 power。
+            // 计算当前高斯中心投影到像素平面的坐标 xy 与 当前像素的坐标 pixf 的差值，并使用锥体参数计算 power。
 			float2 xy = collected_xy[j];    // 当前处理的2D高斯 中心的像素坐标
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };    // 当前处理像素 到 2D高斯中心像素坐标的 位移向量
 			float4 con_o = collected_conic_opacity[j];          // 当前处理的高斯的 2D协方差矩阵的逆 和 不透明度，x、y、z: 分别是2D协方差逆矩阵的上半对角元素, w：不透明度
@@ -411,16 +410,16 @@ renderCUDA(
 			if (power > 0.0f)
 				continue;
 
-            // 通过相乘 高斯的不透明度 及其 从均值的指数下降 来计算3DGS论文公式(2)中的α值，避免数值不稳定性
+            // 当前高斯最终的不透明度（3DGS论文公式(2)中的α值，对光线的吸收程度）= 高斯椭球的不透明度 * 强度
 			float alpha = min(0.99f, con_o.w * exp(power));
 
             if (alpha < 1.0f / 255.0f)
                 // α太小，就将该高斯当作透明的
 				continue;
 
-            // 计算透射率：累乘 a
+            // 计算经过当前高斯后的 透射率（光线剩余的能量）= 累积经过之前高斯的 透射率 和 当前高斯的不透明度
             float test_T = T * (1 - alpha);
-            // 透射率 < 极小值，即不透明度接近 1，标记这个像素的渲染结束，不进行后续渲染
+            // 透射率 < 极小值，光线能量太低，标记这个像素的渲染结束，不进行后续渲染
 			if (test_T < 0.0001f) {
 				done = true;
 				continue;
@@ -436,15 +435,16 @@ renderCUDA(
 			last_contributor = contributor;
 		}
 	}
+    // 当前像素渲染完成
 
     // 7. 写入最终渲染结果
 	if (inside) {
         // 所有处理有效像素的 thread都会将其最终的渲染数据 写入帧缓冲区和辅助缓冲区
-        // 输出的 渲染像素pix_id的颜色过程中 累积的透射率
-        final_T[pix_id] = T;
-        // 输出的 渲染像素pix_id的颜色过程中 穿过的高斯的个数，也是最后一个对渲染当前像素RGB值 有贡献的高斯ID最后一个有贡献的高斯ID
-		n_contrib[pix_id] = last_contributor;
-		// 最后输出的RGB颜色值 加上 背景颜色
+
+        final_T[pix_id] = T;    // 输出的 渲染像素pix_id的颜色过程中 累积的透射率
+		n_contrib[pix_id] = last_contributor;   // 输出的 渲染像素pix_id的颜色过程中 穿过的高斯的个数，也是最后一个对渲染当前像素RGB值 最后一个有贡献的高斯ID
+
+        // 最后输出的RGB颜色值 加上 背景颜色
         for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 	}
