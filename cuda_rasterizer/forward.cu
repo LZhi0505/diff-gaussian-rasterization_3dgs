@@ -405,31 +405,35 @@ renderCUDA(
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };    // 当前处理像素 到 2D高斯中心像素坐标的 位移向量
 			float4 con_o = collected_conic_opacity[j];          // 当前处理的高斯的 2D协方差矩阵的逆 和 不透明度，x、y、z: 分别是2D协方差逆矩阵的上半对角元素, w：不透明度
 
-            // 2D高斯分布的指数部分，-1/2 d^T Σ^-1 d，用于确定像素在光栅化过程中的贡献程度
+            // 一个高斯对渲染某个像素的贡献度 = 光线经之前高斯后剩余的能量 * 该高斯对光线的吸收程度
+            //                          = 光线经之前高斯累积的透射率 T * 当前高斯的alpha（该高斯的不透明度 * 其2D高斯的投影分布）
+            // (1) 计算 当前高斯对光线的吸收程度 alpha（3DGS论文公式(2)中的α值）
+            // 2D高斯分布的指数部分：-1/2 d^T Σ^-1 d
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
 
-            // 当前高斯最终的不透明度（3DGS论文公式(2)中的α值，对光线的吸收程度）= 高斯椭球的不透明度 * 强度
+            // 当前高斯的 alpha = 高斯的不透明度(包含2D高斯投影分布前的常数部分) * 2D高斯的投影分布
 			float alpha = min(0.99f, con_o.w * exp(power));
 
             if (alpha < 1.0f / 255.0f)
-                // α太小，就将该高斯当作透明的
+                // 太小，就将该高斯当作透明的，跳过渲染它
 				continue;
 
-            // 计算经过当前高斯后的 透射率（光线剩余的能量）= 累积经过之前高斯的 透射率 和 当前高斯的不透明度
+            // (2) 计算 经当前高斯后的透射率 test_T = 经之前高斯累积的透射率 T * 当前高斯的 alpha
             float test_T = T * (1 - alpha);
-            // 透射率 < 极小值，光线能量太低，标记这个像素的渲染结束，不进行后续渲染
 			if (test_T < 0.0001f) {
+                // < 极小值，光线能量太低，标记这个像素的渲染结束，不进行后续渲染
 				done = true;
 				continue;
 			}
 
-            // 通过 a-blending 计算当前像素的RGB三通道 颜色值 C。3DGS论文公式(3)
+            // (3) a-blending计算当前像素的RGB三通道 颜色值 C（3DGS论文公式(3)）
 			for (int ch = 0; ch < CHANNELS; ch++)
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T; // 每个通道的值是 累加 当前像素触及到的高斯 在当前相机中心的观测方向下 的RGB值 * a * 透射率T
+                // 每个通道的颜色 = 累加 当前高斯的颜色 * 当前高斯的贡献度
+				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
 
-			T = test_T;
+			T = test_T; // 更新经之前高斯累积的透射率
 
             // 记录 渲染当前像素射线 穿过的高斯的个数，也是最后一个对渲染当前像素RGB值 有贡献的高斯ID
 			last_contributor = contributor;
