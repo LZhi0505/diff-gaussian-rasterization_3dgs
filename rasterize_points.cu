@@ -217,16 +217,16 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
-	  dL_dout_color.contiguous().data<float>(),     // 输入的 loss对渲染的每个像素颜色的 梯度
-	  dL_dmeans2D.contiguous().data<float>(),
-	  dL_dconic.contiguous().data<float>(),  
-	  dL_dopacity.contiguous().data<float>(),
-	  dL_dcolors.contiguous().data<float>(),
-	  dL_dmeans3D.contiguous().data<float>(),
-	  dL_dcov3D.contiguous().data<float>(),
-	  dL_dsh.contiguous().data<float>(),
-	  dL_dscales.contiguous().data<float>(),
-	  dL_drotations.contiguous().data<float>(),
+	  dL_dout_color.contiguous().data<float>(),     // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 梯度
+	  dL_dmeans2D.contiguous().data<float>(),   // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
+	  dL_dconic.contiguous().data<float>(),         // 输出的 loss对所有高斯 椭圆二次型矩阵的 导数
+	  dL_dopacity.contiguous().data<float>(),   // 输出的 loss对所有高斯 不透明度的 导数
+	  dL_dcolors.contiguous().data<float>(),        // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
+	  dL_dmeans3D.contiguous().data<float>(),   // 输出的 loss对所有高斯 中心世界坐标的 导数
+	  dL_dcov3D.contiguous().data<float>(),     // 输出的 loss对所有高斯 3D协方差矩阵的 导数
+	  dL_dsh.contiguous().data<float>(),        // 输出的 loss对所有高斯 球谐系数的 导数
+	  dL_dscales.contiguous().data<float>(),    // 输出的 loss对所有高斯 缩放因子的 导数
+	  dL_drotations.contiguous().data<float>(),     // 输出的 loss对所有高斯 旋转四元数的 导数
 	  debug);
   }
 

@@ -299,7 +299,7 @@ int CudaRasterizer::Rasterizer::forward(
 	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);    // 用显存块首地址作为参数，调用 fromChunk函数为 GeometryState geo申请显存
 
 	if (radii == nullptr) {
-        // 如果传入的、要输出的 高斯在图像平面的投影半径为 nullptr，则将其设为
+        // 如果传入的、要输出的 高斯在图像平面的投影半径 为空指针，则将其设为 geomState缓存的投影半径
 		radii = geomState.internal_radii;
 	}
 
@@ -464,16 +464,16 @@ void CudaRasterizer::Rasterizer::backward(
 	char* geom_buffer,  // 存储所有高斯 几何数据的 tensor：包括2D中心像素坐标、相机坐标系下的深度、3D协方差矩阵等
 	char* binning_buffer,   // 存储所有高斯 排序数据的 tensor：包括未排序和排序后的 所有高斯覆盖的tile的 keys、values列表
 	char* img_buffer,       // 存储所有高斯 渲染后数据的 tensor：包括累积的透射率、最后一个贡献的高斯ID
-	const float* dL_dpix,   // 输入的 loss对渲染的每个像素颜色的 梯度
+	const float* dL_dpix,   // 输出的 loss对渲染的每个像素颜色的 梯度
 	float* dL_dmean2D,  // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
 	float* dL_dconic,   // 输出的 loss对所有高斯 椭圆二次型矩阵的 导数
-	float* dL_dopacity, // 输出的 loss对所有高斯 不透明度的导数
+	float* dL_dopacity, // 输出的 loss对所有高斯 不透明度的 导数
 	float* dL_dcolor,   // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
 	float* dL_dmean3D,  // 输出的 loss对所有高斯 中心世界坐标的 导数
 	float* dL_dcov3D,   // 输出的 loss对所有高斯 3D协方差矩阵的 导数
 	float* dL_dsh,      // 输出的 loss对所有高斯 球谐系数的 导数
 	float* dL_dscale,   // 输出的 loss对所有高斯 缩放因子的 导数
-	float* dL_drot,     // 输出的 loss对所有高斯 旋转四元数的导数
+	float* dL_drot,     // 输出的 loss对所有高斯 旋转四元数的 导数
 	bool debug) // 默认为False
 {
     // 这些缓冲区都是在前向传播的时候存下来的，现在拿出来用
@@ -482,20 +482,21 @@ void CudaRasterizer::Rasterizer::backward(
 	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
 
 	if (radii == nullptr) {
+        // 如果传入的 所有高斯投影在当前相机图像平面上的最大半径数组 空指针，则从geomState缓冲区中获取
 		radii = geomState.internal_radii;
 	}
 
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
-	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
-	const dim3 block(BLOCK_X, BLOCK_Y, 1);
+	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1); // 3. 线程块 block（tile）的维度，(W/16，H/16)
+	const dim3 block(BLOCK_X, BLOCK_Y, 1);  // 一个block中 线程thread的维度，(16, 16, 1)
 
     // 如果传入的预计算的颜色 不是空指针，则是预计算的颜色
     //                    是空指针（默认），则是 preprocess中计算的 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
 
-    //! 反向传播中的 核心渲染函数，计算 loss对 所有高斯的2D中心坐标、圆锥矩阵、不透明度和RGB等数据的 导数。具体实现在 backward.cu/renderCUDA
+    //! 反向传播中的 渲染，计算 loss对 所有高斯的2D中心坐标、圆锥矩阵、不透明度和RGB等数据的 导数。具体实现在 backward.cu/renderCUDA
 	CHECK_CUDA(BACKWARD::render(
 		tile_grid,
 		block,

@@ -408,65 +408,68 @@ __global__ void preprocessCUDA(
 		computeCov3D(idx, scales[idx], scale_modifier, rotations[idx], dL_dcov3D, dL_dscale, dL_drot);
 }
 
-// Backward version of the rendering procedure.
-// 反向渲染过程的模板函数
+
+// 反向传播中的 渲染过程
 template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
-	const uint2* __restrict__ ranges,
-	const uint32_t* __restrict__ point_list,
+	const uint2* __restrict__ ranges,   // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
+	const uint32_t* __restrict__ point_list,    // 排序后的 values列表，每个元素是按（大顺序：各tile_ID，小顺序：落在该tile内各高斯的深度）排序后的 高斯ID
 	int W, int H,
-	const float* __restrict__ bg_color,
-	const float2* __restrict__ points_xy_image,
-	const float4* __restrict__ conic_opacity,
-	const float* __restrict__ colors,
-	const float* __restrict__ final_Ts,
-	const uint32_t* __restrict__ n_contrib,
-	const float* __restrict__ dL_dpixels,
-	float3* __restrict__ dL_dmean2D,
-	float4* __restrict__ dL_dconic2D,
-	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors)
+	const float* __restrict__ bg_color,     // 背景颜色，默认为[1,1,1]，黑色
+	const float2* __restrict__ points_xy_image,     // 所有高斯 中心在当前相机图像平面的二维坐标 数组
+	const float4* __restrict__ conic_opacity,       // 所有高斯 2D协方差的逆 和 不透明度 数组
+	const float* __restrict__ colors,       // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
+	const float* __restrict__ final_Ts,     // 渲染后每个像素 pixel的 累积的透射率 的数组
+	const uint32_t* __restrict__ n_contrib,     // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
+	const float* __restrict__ dL_dpixels,   // 输出的 loss对渲染的每个像素颜色的 梯度
+	float3* __restrict__ dL_dmean2D,    // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
+	float4* __restrict__ dL_dconic2D,   // 输出的 loss对所有高斯 椭圆二次型矩阵的 导数
+	float* __restrict__ dL_dopacity,    // 输出的 loss对所有高斯 不透明度的 导数
+	float* __restrict__ dL_dcolors)     // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
 {
-	// We rasterize again. Compute necessary block info.
     // 重新进行光栅化计算，计算所需的块信息
-	auto block = cg::this_thread_block();
-	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
-	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
-	const uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
-	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
-	const uint32_t pix_id = W * pix.y + pix.x;
-	const float2 pixf = { (float)pix.x, (float)pix.y };
+    // 1. 确定当前block处理的 tile的像素范围
+	auto block = cg::this_thread_block();   // 当前线程所处的 block（对应一个 tile）
+	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;     // 在水平方向上有多少个 block
+	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y }; // 当前处理的 tile的 左上角像素坐标
+	const uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };    // 当前处理的 tile的 右下角像素坐标
+	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };   // 当前处理的 像素 在像素平面的坐标
+	const uint32_t pix_id = W * pix.y + pix.x;  // 当前处理的 像素 在像素平面的　索引
+	const float2 pixf = { (float)pix.x, (float)pix.y }; // 当前处理的 像素 在像素平面的坐标
 
-	const bool inside = pix.x < W&& pix.y < H;
-    // 当前处理的tile对应的3D gaussian的起始id和结束id
+    // 2. 判断当前处理的 像素 是否在图像有效像素范围内
+	const bool inside = pix.x < W && pix.y < H;
+
+    // 3. 计算当前tile触及的高斯个数，太多，则分rounds批渲染
+    // 根据当前处理的 tile_ID，获取该tile在排序后的keys列表中的起始、终止位置，[x,y)。个数y-x：投影到该tile上的高斯的个数。
+    // 也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
 
-	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE); // 高斯个数过多，则分批处理，每批最多处理 BLOCK_SIZE=16*16个高斯
 
 	bool done = !inside;
-	int toDo = range.y - range.x;
+	int toDo = range.y - range.x;   // 当前tile还未处理的 高斯的个数
 
-	__shared__ int collected_id[BLOCK_SIZE];
-	__shared__ float2 collected_xy[BLOCK_SIZE];
-	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
-	__shared__ float collected_colors[C * BLOCK_SIZE];
+    // 4. 初始化同一block中的各线程共享的显存，分别定义三个共享显存数组，用于在每个block内共享数据
+	__shared__ int collected_id[BLOCK_SIZE];    // 记录各线程处理的 高斯的ID
+	__shared__ float2 collected_xy[BLOCK_SIZE]; // 记录各线程处理的高斯 中心在2D平面的 像素坐标
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];  // 记录各线程处理的高斯的2D协方差矩阵的 逆 和 不透明度
+	__shared__ float collected_colors[C * BLOCK_SIZE];  // 记录各线程处理的 像素的颜色
 
-	// In the forward, we stored the final value for T, the
-	// product of all (1 - alpha) factors.
-    // 核心就是根据alpha合成的公式，手推每个变量的反向传播公式，推导过程可参考论文里的附录。
-    // 在正向传播中，存储了T的最终值，即所有(1 - alpha)因子的乘积
-	const float T_final = inside ? final_Ts[pix_id] : 0;
+    //! 核心：根据alpha合成的公式，手推每个变量的反向传播公式，推导过程可参考论文里的附录。
+
+	const float T_final = inside ? final_Ts[pix_id] : 0;    // 需处理该像素，则从前向传播中取出渲染当前像素后的 透射率（该像素射线上所有高斯的(1 - alpha)的乘积）
+                                                            // 已处理完该像素，则为0，表示光线的能量很低
 	float T = T_final;
 
-	// We start from the back. The ID of the last contributing
-	// Gaussian is known from each pixel from the forward.
-    // 从后面开始。最后一个贡献的高斯的ID是从每个像素的正向传播中已知的
-	uint32_t contributor = toDo;
-	const int last_contributor = inside ? n_contrib[pix_id] : 0;
+    // 从后面开始。可以从前向传播中得知 对渲染当前像素最后一个有贡献的 高斯ID
+	uint32_t contributor = toDo;    // 还要处理的高斯的 个数
+	const int last_contributor = inside ? n_contrib[pix_id] : 0;    // 需处理该像素，通过当前像素在像素平面的索引 取出 对渲染它的有贡献的最后一个高斯的ID
+                                                                    // 已处理完该像素，则为0
 
-	float accum_rec[C] = { 0 };
-	float dL_dpixel[C];     // 当前pixel对应的梯度
+	float accum_rec[C] = { 0 }; // 累积的
+	float dL_dpixel[C];     // 当前像素 对应的梯度
 	if (inside)
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
