@@ -420,7 +420,7 @@ renderCUDA(
                 // 太小，就将该高斯当作透明的，跳过渲染它
 				continue;
 
-            // (2) 计算 经当前高斯后的透射率 test_T = 经之前高斯累积的透射率 T * 当前高斯的 alpha
+            // (2) 计算 经当前高斯后的透射率 test_T = 经之前高斯累积的透射率 T * 当前高斯吸收后的光线能量(1-当前高斯的alpha)
             float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f) {
                 // < 极小值，光线能量太低，标记这个像素的渲染结束，不进行后续渲染
@@ -428,7 +428,7 @@ renderCUDA(
 				continue;
 			}
 
-            // (3) a-blending计算当前像素的RGB三通道 颜色值 C（3DGS论文公式(3)）
+            // (3) α-blending计算当前像素的RGB三通道 颜色值 C（3DGS论文公式(3)）
 			for (int ch = 0; ch < CHANNELS; ch++)
                 // 每个通道的颜色 = 累加 当前高斯的颜色 * 当前高斯的贡献度
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
