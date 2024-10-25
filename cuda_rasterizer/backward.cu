@@ -409,7 +409,10 @@ __global__ void preprocessCUDA(
 }
 
 
-// 反向传播中的 渲染过程
+/**
+ * 反向传播中的 渲染
+ * @tparam C = 3，即RGB三个通道
+ */
 template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
@@ -422,7 +425,7 @@ renderCUDA(
 	const float* __restrict__ colors,       // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float* __restrict__ final_Ts,     // 渲染后每个像素 pixel的 累积的透射率 的数组
 	const uint32_t* __restrict__ n_contrib,     // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
-	const float* __restrict__ dL_dpixels,   // 输出的 loss对渲染的每个像素颜色的 梯度
+	const float* __restrict__ dL_dpixels,   // loss对渲染的RGB图像中每个像素颜色的 梯度
 	float3* __restrict__ dL_dmean2D,    // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
 	float4* __restrict__ dL_dconic2D,   // 输出的 loss对所有高斯 椭圆二次型矩阵的 导数
 	float* __restrict__ dL_dopacity,    // 输出的 loss对所有高斯 不透明度的 导数
@@ -431,12 +434,17 @@ renderCUDA(
     // 重新进行光栅化计算，计算所需的块信息
     // 1. 确定当前block处理的 tile的像素范围
 	auto block = cg::this_thread_block();   // 当前线程所处的 block（对应一个 tile）
-	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;     // 在水平方向上有多少个 block
-	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y }; // 当前处理的 tile的 左上角像素坐标
-	const uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };    // 当前处理的 tile的 右下角像素坐标
-	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };   // 当前处理的 像素 在像素平面的坐标
-	const uint32_t pix_id = W * pix.y + pix.x;  // 当前处理的 像素 在像素平面的　索引
-	const float2 pixf = { (float)pix.x, (float)pix.y }; // 当前处理的 像素 在像素平面的坐标
+
+    const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;     // 在水平方向上有多少个 block
+
+    // 当前处理的tile的 左上角像素的坐标、右下角像素的坐标
+    const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	const uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+    // 当前处理的 像素 在像素平面的坐标
+    const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+
+    const uint32_t pix_id = W * pix.y + pix.x;  // 当前处理的 像素 在像素平面的　索引
+	const float2 pixf = { (float)pix.x, (float)pix.y }; // 当前处理的 像素 在像素平面的坐标(float)
 
     // 2. 判断当前处理的 像素 是否在图像有效像素范围内
 	const bool inside = pix.x < W && pix.y < H;
@@ -449,30 +457,30 @@ renderCUDA(
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE); // 高斯个数过多，则分批处理，每批最多处理 BLOCK_SIZE=16*16个高斯
 
 	bool done = !inside;
-	int toDo = range.y - range.x;   // 当前tile还未处理的 高斯的个数
+	int toDo = range.y - range.x;   // 当前tile还未处理的 高斯的个数 = 落在该tile上的高斯的个数
 
     // 4. 初始化同一block中的各线程共享的显存，分别定义三个共享显存数组，用于在每个block内共享数据
 	__shared__ int collected_id[BLOCK_SIZE];    // 记录各线程处理的 高斯的ID
-	__shared__ float2 collected_xy[BLOCK_SIZE]; // 记录各线程处理的高斯 中心在2D平面的 像素坐标
-	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];  // 记录各线程处理的高斯的2D协方差矩阵的 逆 和 不透明度
+	__shared__ float2 collected_xy[BLOCK_SIZE]; // 记录各线程处理的 高斯 中心在2D平面的 像素坐标
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];  // 记录各线程处理的 高斯的 2D协方差矩阵的 逆 和 不透明度
 	__shared__ float collected_colors[C * BLOCK_SIZE];  // 记录各线程处理的 像素的颜色
 
-    //! 核心：根据alpha合成的公式，手推每个变量的反向传播公式，推导过程可参考论文里的附录。
+    //! 核心：根据α-blending的公式，手推每个变量的反向传播公式，推导过程可参考论文里的附录。
 
-	const float T_final = inside ? final_Ts[pix_id] : 0;    // 需处理该像素，则从前向传播中取出渲染当前像素后的 透射率（该像素射线上所有高斯的(1 - alpha)的乘积）
-                                                            // 已处理完该像素，则为0，表示光线的能量很低
-	float T = T_final;
+    // 从前向传播中取出 渲染当前像素后的 累积透射率 = 该像素射线上所有高斯的(1 - α)的乘积
+	const float T_final = inside ? final_Ts[pix_id] : 0;
 
-    // 从后面开始。可以从前向传播中得知 对渲染当前像素最后一个有贡献的 高斯ID
-	uint32_t contributor = toDo;    // 还要处理的高斯的 个数
-	const int last_contributor = inside ? n_contrib[pix_id] : 0;    // 需处理该像素，通过当前像素在像素平面的索引 取出 对渲染它的有贡献的最后一个高斯的ID
-                                                                    // 已处理完该像素，则为0
+    float T = T_final;
+
+    // 从后面开始。
+	uint32_t contributor = toDo;    // 排序在最后一个的高斯ID = 落在该tile上的高斯的个数
+    const int last_contributor = inside ? n_contrib[pix_id] : 0;    // 从前向传播中取出 该像素穿过的高斯的个数 = 最后一个对渲染该像素RGB值 有贡献的高斯ID
 
 	float accum_rec[C] = { 0 }; // 累积的
 	float dL_dpixel[C];     // 当前像素 对应的梯度
 	if (inside)
 		for (int i = 0; i < C; i++)
-			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];  // loss对当前像素 颜色的 梯度
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
@@ -656,21 +664,22 @@ void BACKWARD::preprocess(
 }
 
 void BACKWARD::render(
-	const dim3 grid, const dim3 block,
-	const uint2* ranges,
-	const uint32_t* point_list,
+	const dim3 grid,    // 线程块 block（tile）的维度，(W/16, H/16, 1)
+    const dim3 block,   // 一个block中 线程thread的维度，(16, 16, 1)
+	const uint2* ranges,    // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数
+	const uint32_t* point_list, // 按深度排序后的 所有高斯覆盖的tile的 values列表，每个元素是 对应高斯的ID
 	int W, int H,
-	const float* bg_color,
-	const float2* means2D,
-	const float4* conic_opacity,
-	const float* colors,
-	const float* final_Ts,
-	const uint32_t* n_contrib,
-	const float* dL_dpixels,
-	float3* dL_dmean2D,
-	float4* dL_dconic2D,
-	float* dL_dopacity,
-	float* dL_dcolors)
+	const float* bg_color,  // 背景颜色，默认为[1,1,1]，黑色
+	const float2* means2D,  // 所有高斯 中心投影在当前相机图像平面的二维坐标 数组
+	const float4* conic_opacity,    // 所有高斯 2D协方差的逆 和 不透明度 数组
+	const float* colors,    // 默认是 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
+	const float* final_Ts,  // 渲染后每个像素 pixel的 累积的透射率 的数组
+	const uint32_t* n_contrib,  // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
+	const float* dL_dpixels,    // loss对渲染的RGB图像中每个像素颜色的 梯度
+	float3* dL_dmean2D,     // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
+	float4* dL_dconic2D,    // 输出的 loss对所有高斯 椭圆二次型矩阵的 导数
+	float* dL_dopacity,     // 输出的 loss对所有高斯 不透明度的 导数
+	float* dL_dcolors)      // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
 {
     // 调用CUDA内核函数执行光栅化过程
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(

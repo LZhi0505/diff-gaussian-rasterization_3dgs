@@ -76,21 +76,24 @@ uint32_t getHigherMsb(uint32_t n)
 }
 
 
-// 检查某个线程的高斯是否在当前相机的视锥体内，bool类型输出到 present数组内
+
+/**
+ * 检查某个线程处理的高斯是否在当前相机的视锥体内
+ */
 __global__ void checkFrustum(
     int P,          // 所有高斯的个数
 	const float* orig_points,   // 所有高斯 中心的世界坐标
 	const float* viewmatrix,    // 观测变换矩阵，W2C
 	const float* projmatrix,    // 观测变换*投影变换矩阵，W2NDC = W2C * C2NDC
-	bool* present)      // 输出的 所有高斯是否被当前相机看见的标志
+	bool* present)      // 输出的 所有高斯 是否在当前相机视锥体内的标志 数组
 {
     // 获取当前线程处理的高斯的索引
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
 		return;
 
-	float3 p_view;  // 输出的 该高斯在相机坐标系下的位置
-    // 检查，如果不在当前相机视锥体内，则为False
+	float3 p_view;  // 该高斯在当前相机坐标系下的坐标
+    // 检查该高斯是否在当前相机的视锥体内
 	present[idx] = in_frustum(idx, orig_points, viewmatrix, projmatrix, false, p_view);
 }
 
@@ -175,13 +178,16 @@ __global__ void identifyTileRanges(
 		ranges[currtile].y = L;
 }
 
-// 检查所有高斯是否被在当前相机的视锥体内，即是否被当前相机看见，标志保存在 present数组中
+
+/**
+ * 检查所有高斯是否在当前相机的视锥体内
+ */
 void CudaRasterizer::Rasterizer::markVisible(
 	int P,          // 所有高斯的个数
 	float* means3D,     // 所有高斯 中心的世界坐标
 	float* viewmatrix,  // 观测变换矩阵，W2C
 	float* projmatrix,  // 观测变换*投影变换矩阵，W2NDC = W2C * C2NDC
-	bool* present)      // 输出的 所有高斯是否被当前相机看见的标志
+	bool* present)      // 输出的 所有高斯 是否在当前相机视锥体内的标志 数组
 {
 	checkFrustum << <(P + 255) / 256, 256 >> > (
 		P,
@@ -303,7 +309,7 @@ int CudaRasterizer::Rasterizer::forward(
 		radii = geomState.internal_radii;
 	}
 
-    // 3. 定义一个 tile_grid的维度，即在水平和垂直方向上需要多少个线程块 block来覆盖整个渲染区域，(W/16，H/16)
+    // 3. 定义一个 tile_grid的维度，即在水平和垂直方向上需要多少个线程块 block来覆盖整个渲染区域，(W/16, H/16, 1)
 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
     // 定义一个 block的维度，即在水平和垂直方向上的线程 thread个数。每个线程处理一个像素，则每个block处理16*16个像素，(16, 16, 1)
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
@@ -440,7 +446,7 @@ int CudaRasterizer::Rasterizer::forward(
 
 
 /**
- * 反向传播，计算loss对前向传播输出tensor的梯度
+ * 反向传播，计算loss对前向传播输出tensor的 梯度
  */
 void CudaRasterizer::Rasterizer::backward(
 	const int P,    // 所有高斯的个数
@@ -464,7 +470,7 @@ void CudaRasterizer::Rasterizer::backward(
 	char* geom_buffer,  // 存储所有高斯 几何数据的 tensor：包括2D中心像素坐标、相机坐标系下的深度、3D协方差矩阵等
 	char* binning_buffer,   // 存储所有高斯 排序数据的 tensor：包括未排序和排序后的 所有高斯覆盖的tile的 keys、values列表
 	char* img_buffer,       // 存储所有高斯 渲染后数据的 tensor：包括累积的透射率、最后一个贡献的高斯ID
-	const float* dL_dpix,   // 输出的 loss对渲染的每个像素颜色的 梯度
+	const float* dL_dpix,   // loss对渲染的RGB图像中每个像素颜色的 梯度
 	float* dL_dmean2D,  // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
 	float* dL_dconic,   // 输出的 loss对所有高斯 椭圆二次型矩阵的 导数
 	float* dL_dopacity, // 输出的 loss对所有高斯 不透明度的 导数
@@ -482,44 +488,47 @@ void CudaRasterizer::Rasterizer::backward(
 	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
 
 	if (radii == nullptr) {
-        // 如果传入的 所有高斯投影在当前相机图像平面上的最大半径数组 空指针，则从geomState缓冲区中获取
+        // 如果传入的 所有高斯投影在当前相机图像平面上的最大半径数组为 空指针，则从geomState缓冲区中获取
 		radii = geomState.internal_radii;
 	}
 
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
-	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1); // 3. 线程块 block（tile）的维度，(W/16，H/16)
+	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1); // 线程块 block（tile）的维度，(W/16, H/16, 1)
 	const dim3 block(BLOCK_X, BLOCK_Y, 1);  // 一个block中 线程thread的维度，(16, 16, 1)
 
     // 如果传入的预计算的颜色 不是空指针，则是预计算的颜色
     //                    是空指针（默认），则是 preprocess中计算的 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
 
-    //! 反向传播中的 渲染，计算 loss对 所有高斯的2D中心坐标、圆锥矩阵、不透明度和RGB等数据的 导数。具体实现在 backward.cu/renderCUDA
+    //! 反传中的 渲染 部分：计算 loss对 所有高斯的2D中心坐标、圆锥矩阵、不透明度和RGB等数据的 导数。具体实现在 backward.cu/renderCUDA
 	CHECK_CUDA(BACKWARD::render(
-		tile_grid,
-		block,
-		imgState.ranges,
-		binningState.point_list,
+		tile_grid,  // 线程块 block（tile）的维度，(W/16, H/16, 1)
+		block,  // 一个block中 线程thread的维度，(16, 16, 1)
+		imgState.ranges,    // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数
+		binningState.point_list,    // 按深度排序后的 所有高斯覆盖的tile的 values列表，每个元素是 对应高斯的ID
 		width, height,
-		background,
-		geomState.means2D,
-		geomState.conic_opacity,
-		color_ptr,
-		imgState.accum_alpha,
-		imgState.n_contrib,
-		dL_dpix,
-		(float3*)dL_dmean2D,
-		(float4*)dL_dconic,
-		dL_dopacity,
-		dL_dcolor), debug)
+		background,     // 背景颜色，默认为[1,1,1]，黑色
+		geomState.means2D,      // 所有高斯 中心投影在当前相机图像平面的二维坐标 数组
+		geomState.conic_opacity,    // 所有高斯 2D协方差的逆 和 不透明度 数组
+		color_ptr,      // 默认是 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
+		imgState.accum_alpha,   // 渲染后每个像素 pixel的 累积的透射率 的数组
+		imgState.n_contrib,     // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
+		dL_dpix,    // loss对渲染的RGB图像中每个像素颜色的 梯度
+		(float3*)dL_dmean2D,    // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
+		(float4*)dL_dconic,     // 输出的 loss对所有高斯 椭圆二次型矩阵的 导数
+		dL_dopacity,            // 输出的 loss对所有高斯 不透明度的 导数
+		dL_dcolor),     // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
+        debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
 	// use the one we computed ourselves.
     // 处理预处理的剩余部分
 	const float* cov3D_ptr = (cov3D_precomp != nullptr) ? cov3D_precomp : geomState.cov3D;
+
+    //! 反传中的 预处理 部分：
 	CHECK_CUDA(BACKWARD::preprocess(P, D, M,
 		(float3*)means3D,
 		radii,

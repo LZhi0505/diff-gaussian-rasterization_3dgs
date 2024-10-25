@@ -172,7 +172,7 @@ __forceinline__ __device__ bool in_frustum(int idx, // 该高斯的索引
 	const float* viewmatrix,    // 观测变换矩阵，W2C
 	const float* projmatrix,    // 观测变换矩阵 * 投影变换矩阵，W2NDC = W2C * C2NDC
 	bool prefiltered,           // 预滤除的标志，默认为False
-	float3& p_view)             // 输出的 该高斯在相机坐标系下的位置
+	float3& p_view)             // 输出的 该高斯中心在相机坐标系下的坐标
 {
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };   // 该高斯中心的世界坐标
 

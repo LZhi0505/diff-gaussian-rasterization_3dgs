@@ -196,7 +196,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_drotations = torch::zeros({P, 4}, means3D.options());
   
   if(P != 0) {
-      // 场景中存在高斯，则进行反向传播
       //! 实际反向传播
 	  CudaRasterizer::Rasterizer::backward(P, degree, M, R,
 	  background.contiguous().data<float>(),
@@ -217,7 +216,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
-	  dL_dout_color.contiguous().data<float>(),     // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 梯度
+	  dL_dout_color.contiguous().data<float>(),     // loss对渲染的RGB图像中每个像素颜色的 梯度
 	  dL_dmeans2D.contiguous().data<float>(),   // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
 	  dL_dconic.contiguous().data<float>(),         // 输出的 loss对所有高斯 椭圆二次型矩阵的 导数
 	  dL_dopacity.contiguous().data<float>(),   // 输出的 loss对所有高斯 不透明度的 导数
@@ -233,6 +232,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dcov3D, dL_dsh, dL_dscales, dL_drotations);
 }
 
+
+/**
+ * 检查所有高斯是否在当前相机的视锥体内
+ * @return: present：所有高斯 是否在当前相机视锥体内的标志 数组
+ */
 torch::Tensor markVisible(
 		torch::Tensor& means3D,     // 所有高斯 中心的世界坐标
 		torch::Tensor& viewmatrix,  // 观测变换矩阵，W2C
@@ -240,9 +244,9 @@ torch::Tensor markVisible(
 { 
   const int P = means3D.size(0);    // 所有高斯的个数
 
-  // 初始化 present (N，)为全 False的 Tensor
+  // 输出的 所有高斯 是否在当前相机视锥体内的标志 数组， (N，)
   torch::Tensor present = torch::full({P}, false, means3D.options().dtype(at::kBool));
- 
+
   if(P != 0)
   {
 	CudaRasterizer::Rasterizer::markVisible(P,
