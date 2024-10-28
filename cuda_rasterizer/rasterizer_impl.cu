@@ -470,9 +470,9 @@ void CudaRasterizer::Rasterizer::backward(
 	char* geom_buffer,  // 存储所有高斯 几何数据的 tensor：包括2D中心像素坐标、相机坐标系下的深度、3D协方差矩阵等
 	char* binning_buffer,   // 存储所有高斯 排序数据的 tensor：包括未排序和排序后的 所有高斯覆盖的tile的 keys、values列表
 	char* img_buffer,       // 存储所有高斯 渲染后数据的 tensor：包括累积的透射率、最后一个贡献的高斯ID
-	const float* dL_dpix,   // loss对渲染的RGB图像中每个像素颜色的 梯度
+	const float* dL_dpix,   // 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
 	float* dL_dmean2D,  // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
-	float* dL_dconic,   // 输出的 loss对所有高斯 椭圆二次型矩阵的 导数
+	float* dL_dconic,   // 输出的 loss对所有高斯 2D协方差矩阵的 导数
 	float* dL_dopacity, // 输出的 loss对所有高斯 不透明度的 导数
 	float* dL_dcolor,   // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
 	float* dL_dmean3D,  // 输出的 loss对所有高斯 中心世界坐标的 导数
@@ -515,9 +515,9 @@ void CudaRasterizer::Rasterizer::backward(
 		color_ptr,      // 默认是 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 		imgState.accum_alpha,   // 渲染后每个像素 pixel的 累积的透射率 的数组
 		imgState.n_contrib,     // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
-		dL_dpix,    // loss对渲染的RGB图像中每个像素颜色的 梯度
+		dL_dpix,    // 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
 		(float3*)dL_dmean2D,    // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
-		(float4*)dL_dconic,     // 输出的 loss对所有高斯 椭圆二次型矩阵的 导数
+		(float4*)dL_dconic,     // 输出的 loss对所有高斯 2D协方差矩阵的 导数
 		dL_dopacity,            // 输出的 loss对所有高斯 不透明度的 导数
 		dL_dcolor),     // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
         debug)

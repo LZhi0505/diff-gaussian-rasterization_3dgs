@@ -122,7 +122,7 @@ class _RasterizeGaussians(torch.autograd.Function):
 
     @staticmethod
     # 定义反向传播梯度下降的规则。调用C++/CUDA实现的 _C.rasterize_gaussians_backward方法
-    # 输入：上下文信息ctx、loss对渲染的RGB图像中每个像素颜色的 梯度
+    # 输入：上下文信息ctx、loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
     # 输出：loss对forward输入的9个变量（所有高斯的 中心投影到图像平面的像素坐标、中心世界坐标、椭圆二次型矩阵、不透明度、当前相机中心观测下高斯的RGB颜色、球谐系数、3D协方差矩阵、缩放因子、旋转四元数）的梯度，不需要返回梯度的变量用None占位
     def backward(
             ctx,    # 上下文信息
@@ -147,7 +147,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raster_settings.projmatrix,     # 观测变换*投影变换矩阵，W2NDC = W2C * C2NDC
                 raster_settings.tanfovx, 
                 raster_settings.tanfovy, 
-                grad_out_color,     # loss对渲染的RGB图像中每个像素颜色的 梯度
+                grad_out_color,     # 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
                 sh,         # 所有高斯的 球谐系数，(N,16,3)
                 raster_settings.sh_degree,  # 当前的球谐阶数
                 raster_settings.campos,     # 当前相机中心的世界坐标

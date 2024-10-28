@@ -24,10 +24,9 @@ namespace cg = cooperative_groups;
  * 常见的数学函数（平移、旋转、缩放、透视投影等）
  */
 
-// Forward method for converting the input spherical harmonics
-// coefficients of each Gaussian to a simple RGB color.
+
 /**
- * 根据一个3D高斯的球谐系数，计算 当前相机中心 看向 该高斯中心 方向的RGB颜色值，(3,)
+ * 根据一个3D高斯的球谐系数，计算 当前相机中心 看向 该高斯中心 方向的 该高斯单一的RGB颜色值，(3,)
  * @param idx   当前高斯的索引
  * @param deg   当前的球谐阶数
  * @param max_coeffs    每个高斯的球谐系数个数=16
@@ -51,14 +50,14 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 	glm::vec3 result = SH_C0 * sh[0];
 
 	if (deg > 0) {
-        // 当前的球谐阶数 > 0，则计算一阶SH系数的颜色值
+        // 当前的球谐阶数 > 0，则计算 一阶SH系数的颜色值
 		float x = dir.x;
 		float y = dir.y;
 		float z = dir.z;
 		result = result - SH_C1 * y * sh[1] + SH_C1 * z * sh[2] - SH_C1 * x * sh[3];
 
 		if (deg > 1) {
-            // 当前的球谐阶数 > 1，则计算二阶SH系数的颜色值
+            // 当前的球谐阶数 > 1，则计算 二阶SH系数的颜色值
 			float xx = x * x, yy = y * y, zz = z * z;
 			float xy = x * y, yz = y * z, xz = x * z;
 			result = result +
@@ -69,7 +68,7 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 				SH_C2[4] * (xx - yy) * sh[8];
 
 			if (deg > 2) {
-                // 当前的球谐阶数 > 2，则计算三阶SH系数的颜色值
+                // 当前的球谐阶数 > 2，则计算 三阶SH系数的颜色值
 				result = result +
 					SH_C3[0] * y * (3.0f * xx - yy) * sh[9] +
 					SH_C3[1] * xy * z * sh[10] +
@@ -363,18 +362,19 @@ renderCUDA(
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE); // 高斯个数过多，则分批处理，每批最多处理 BLOCK_SIZE=16*16个高斯
 	int toDo = range.y - range.x;   // 当前tile还未处理的 高斯的个数
 
-    // 4. 初始化同一block中的各线程共享的显存，分别定义三个共享显存数组，用于在每个block内共享数据
-	__shared__ int collected_id[BLOCK_SIZE];        // 记录各线程处理的 高斯的ID
-	__shared__ float2 collected_xy[BLOCK_SIZE];     // 记录各线程处理的 高斯中心 在2D平面的 像素坐标
+    // 4. 初始化同一block中的各线程共享的三个显存数组，用于在该block内共享数据
+	__shared__ int collected_id[BLOCK_SIZE];        // 记录各线程处理的 高斯ID
+	__shared__ float2 collected_xy[BLOCK_SIZE];     // 记录各线程处理的 高斯中心在当前相机图像平面的 像素坐标
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];  // 记录各线程处理的 高斯的 2D协方差矩阵的 逆 和 不透明度
 
     // 5. 初始化渲染相关变量，包括当前像素颜色 C、贡献者数量
 	float T = 1.0f;     // 透射率：光线经过高斯后 剩余的能量。初值设为 1
-	uint32_t contributor = 0;       // 计算该像素经过了多少个高斯，也是最后一个对渲染当前像素RGB值 有贡献的高斯ID
+	uint32_t contributor = 0;       // 记录当前处理的像素穿过的高斯个数 = 对渲染当前像素RGB值 最后一个有贡献的高斯ID
 	uint32_t last_contributor = 0;  // 存储最终经过的高斯球数量
 	float C[CHANNELS] = { 0 };      // 最后渲染的颜色
 
-    // 6. 外循环：迭代分批渲染任务，每批最多处理 BLOCK_SIZE = 16*16个高斯
+    // 6. 遍历当前tile触及的高斯
+    // 外循环：迭代分批渲染任务，每批最多处理 BLOCK_SIZE = 16*16个高斯
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE) {
         // 检查该block内所有线程都已经完成渲染，则退出循环
 		int num_done = __syncthreads_count(done);   // 通过 __syncthreads_count 函数统计当前block内 done变为 true的线程个数，如果全部线程都完成，则跳出循环
@@ -389,41 +389,40 @@ renderCUDA(
             // 当前线程处理的高斯的ID
 			int coll_id = point_list[range.x + progress];
 
-            collected_id[block.thread_rank()] = coll_id;    // 当前线程处理的高斯ID
-			collected_xy[block.thread_rank()] = points_xy_image[coll_id];   // 当前线程处理的高斯 中心在当前相机图像平面的像素坐标
-			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];  // 当前线程处理的高斯 2D协方差矩阵的逆 和 不透明度
+            collected_id[block.thread_rank()] = coll_id;    // 当前线程处理的 高斯ID
+			collected_xy[block.thread_rank()] = points_xy_image[coll_id];   // 当前线程处理的 高斯中心在当前相机图像平面的 像素坐标
+			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];  // 当前线程处理的 高斯 2D协方差矩阵的逆 和 不透明度
 		}
 		block.sync();   // 迭代每个高斯后，同步当前block下的所有线程
 
 
-        // 内循环：每个线程遍历当前block处理的tile触及的 当前批次的 所有高斯，进行基于锥体参数的渲染计算，并更新颜色信息
+        // 内循环：每个线程遍历 当前批次的高斯，进行基于锥体参数的渲染计算，并更新颜色信息
 		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++) {
 
 			contributor++;  // 对渲染当前像素RGB值有贡献的高斯的个数
 
 			// Resample using conic matrix (cf. "Surface Splatting" by Zwicker et al., 2001)
             // 计算当前高斯中心投影到像素平面的坐标 xy 与 当前像素的坐标 pixf 的差值，并使用锥体参数计算 power。
-			float2 xy = collected_xy[j];    // 当前处理的2D高斯 中心的像素坐标
-			float2 d = { xy.x - pixf.x, xy.y - pixf.y };    // 当前处理像素 到 2D高斯中心像素坐标的 位移向量
-			float4 con_o = collected_conic_opacity[j];          // 当前处理的高斯的 2D协方差矩阵的逆 和 不透明度，x、y、z: 分别是2D协方差逆矩阵的上半对角元素, w：不透明度
+			float2 xy = collected_xy[j];    // 当前高斯中心在图像平面的 像素坐标
+			float2 d = { xy.x - pixf.x, xy.y - pixf.y };    // 当前处理的像素 到 当前2D高斯中心像素坐标的 位移向量
+			float4 con_o = collected_conic_opacity[j];          // 当前高斯的 2D协方差矩阵的逆 和 不透明度，x、y、z: 分别是2D协方差逆矩阵的上半对角元素, w：不透明度
 
             // 另：一个高斯对渲染某个像素的贡献度 = 光线经之前高斯后剩余的能量 * 该高斯对光线的吸收程度
             //                             = 光线经之前高斯累积的透射率 T * 当前高斯的alpha（该高斯的不透明度 * 其2D高斯的投影分布）
 
             // (1) 计算 当前高斯对光线的吸收程度 alpha（3DGS论文公式(2)中的α值）
-            // 2D高斯分布的指数部分：-1/2 d^T Σ^-1 d
+            // 当前2D高斯分布的指数部分：-1/2 d^T Σ^-1 d
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
 
-            // 当前高斯的 alpha = 高斯的不透明度(包含2D高斯投影分布前的常数部分) * 2D高斯的投影分布
+            // 当前高斯的 alpha = 高斯的不透明度(包含2D高斯投影分布前面的常数部分) * 2D高斯的投影分布
 			float alpha = min(0.99f, con_o.w * exp(power));
-
             if (alpha < 1.0f / 255.0f)
-                // 太小，就将该高斯当作透明的，跳过渲染它
+                // 太小，则认为当前高斯对光线的吸收程度低，近似透明，所以跳过渲染它
 				continue;
 
-            // (2) 计算 经当前高斯后的透射率 test_T = 经之前高斯累积的透射率 T * 当前高斯吸收后的光线能量(1-当前高斯的alpha)
+            // (2) 计算 经当前高斯后的透射率（剩余能量） = 经之前高斯光线剩余的能量（T） * 当前高斯吸收光线后剩余的能量（1-alpha）
             float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f) {
                 // < 极小值，光线剩余能量太低，标记这个像素的渲染结束，不进行后续渲染

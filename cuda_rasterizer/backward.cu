@@ -425,9 +425,9 @@ renderCUDA(
 	const float* __restrict__ colors,       // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float* __restrict__ final_Ts,     // 渲染后每个像素 pixel的 累积的透射率 的数组
 	const uint32_t* __restrict__ n_contrib,     // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
-	const float* __restrict__ dL_dpixels,   // loss对渲染的RGB图像中每个像素颜色的 梯度
+	const float* __restrict__ dL_dpixels,   // 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
 	float3* __restrict__ dL_dmean2D,    // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
-	float4* __restrict__ dL_dconic2D,   // 输出的 loss对所有高斯 椭圆二次型矩阵的 导数
+	float4* __restrict__ dL_dconic2D,   // 输出的 loss对所有高斯 2D协方差矩阵的 导数
 	float* __restrict__ dL_dopacity,    // 输出的 loss对所有高斯 不透明度的 导数
 	float* __restrict__ dL_dcolors)     // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
 {
@@ -459,118 +459,119 @@ renderCUDA(
 	bool done = !inside;
 	int toDo = range.y - range.x;   // 当前tile还未处理的 高斯的个数 = 落在该tile上的高斯的个数
 
-    // 4. 初始化同一block中的各线程共享的显存，分别定义三个共享显存数组，用于在每个block内共享数据
-	__shared__ int collected_id[BLOCK_SIZE];    // 记录各线程处理的 高斯的ID
-	__shared__ float2 collected_xy[BLOCK_SIZE]; // 记录各线程处理的 高斯 中心在2D平面的 像素坐标
+    // 4. 初始化同一block中的各线程共享的四个显存数组，用于在该block内共享数据
+	__shared__ int collected_id[BLOCK_SIZE];    // 记录各线程处理的 高斯ID
+	__shared__ float2 collected_xy[BLOCK_SIZE]; // 记录各线程处理的 高斯中心在当前相机图像平面的 像素坐标
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];  // 记录各线程处理的 高斯的 2D协方差矩阵的 逆 和 不透明度
-	__shared__ float collected_colors[C * BLOCK_SIZE];  // 记录各线程处理的 像素的颜色
+	__shared__ float collected_colors[C * BLOCK_SIZE];      // 记录各线程处理的 高斯 在当前相机中心的观测方向下 的RGB三个值
 
-    //! 核心：根据α-blending的公式，手推每个变量的反向传播公式，推导过程可参考论文里的附录。
+    //! 核心：根据α-blending的公式，手推每个变量的反向传播公式，推导过程可参考论文里的附录
 
     // 从前向传播中取出 渲染当前像素后的 累积透射率 = 该像素射线上所有高斯的(1 - α)的乘积
 	const float T_final = inside ? final_Ts[pix_id] : 0;
 
-    float T = T_final;
+    float T = T_final;  // 经当前高斯 之前的 光线剩余能量（累积的透射率）
 
-    // 从后面开始。
-	uint32_t contributor = toDo;    // 排序在最后一个的高斯ID = 落在该tile上的高斯的个数
+    // 从最后面的高斯开始
+	uint32_t contributor = toDo;    // 当前跟踪的高斯ID = 该tile触及的最后一个的高斯ID = 该tile触及的高斯个数
     const int last_contributor = inside ? n_contrib[pix_id] : 0;    // 从前向传播中取出 该像素穿过的高斯的个数 = 最后一个对渲染该像素RGB值 有贡献的高斯ID
 
 	float accum_rec[C] = { 0 }; // 累积的
-	float dL_dpixel[C];     // 当前像素 对应的梯度
+
+    float dL_dpixel[C];         // loss对当前像素 RGB三个值的 梯度
 	if (inside)
 		for (int i = 0; i < C; i++)
-			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];  // loss对当前像素 颜色的 梯度
+			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];  // 取出 loss对当前像素 RGB三个值的 梯度
 
-	float last_alpha = 0;
-	float last_color[C] = { 0 };
+	float last_alpha = 0;   //
+	float last_color[C] = { 0 };    //
 
-	// Gradient of pixel coordinate w.r.t. normalized screen-space viewport corrdinates (-1 to 1)
+    // 像素坐标的梯度。归一化屏幕空间视窗坐标(-1, 1)
     // 从后面开始加载辅助数据到共享内存中，并以相反顺序加载
 	const float ddelx_dx = 0.5 * W;
 	const float ddely_dy = 0.5 * H;
 
-	// Traverse all Gaussians
+    // 遍历当前tile触及的高斯
+    // 外循环：迭代分批渲染任务，每批最多处理 BLOCK_SIZE = 16*16个高斯
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
-		// Load auxiliary data into shared memory, start in the BACK
-		// and load them in revers order.
-        // 将辅助数据加载到共享内存中，从后面开始
-        // 并以相反的顺序加载它们。
-		block.sync();
-		const int progress = i * BLOCK_SIZE + block.thread_rank();
-		if (range.x + progress < range.y)
+        // 将辅助数据加载到共享内存中，从后面开始并以相反的顺序加载它们。
+		block.sync();   // 同步当前block下的所有线程
+		const int progress = i * BLOCK_SIZE + block.thread_rank();  // 当前线程处理的高斯的全局ID。block.thread_rank()：当前线程在该 block内的ID，区间为[0, BLOCK_SIZE)
+        // 当前线程处理的高斯不越界
+        if (range.x + progress < range.y)
 		{
-			const int coll_id = point_list[range.y - progress - 1];
-			collected_id[block.thread_rank()] = coll_id;
-			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
-			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
-			for (int i = 0; i < C; i++)
-				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+			const int coll_id = point_list[range.y - progress - 1]; // 以逆序方式获取高斯ID（从后往前）
+
+            collected_id[block.thread_rank()] = coll_id;    // 当前线程处理的 高斯ID
+			collected_xy[block.thread_rank()] = points_xy_image[coll_id];   // 当前线程处理的 高斯中心在当前相机图像平面的 像素坐标
+			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];  // 当前线程处理的 高斯 2D协方差的逆 和 不透明度
+
+            for (int i = 0; i < C; i++)
+				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];   // 当前线程处理的 高斯 在当前相机中心的观测方向下 的RGB三个值
 		}
 		block.sync();
 
-		// Iterate over Gaussians
-        // 迭代高斯
+        // 内循环：每个线程遍历 当前批次的高斯，进行基于锥体参数的渲染计算，并更新颜色信息
 		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
 		{
-			// Keep track of current Gaussian ID. Skip, if this one is behind the last contributor for this pixel.
-            // 跟踪当前高斯的ID。如果这个高斯位于这个像素的最后一个贡献者之后，就跳过
+            // 当前跟踪的 高斯ID
 			contributor--;
+            // 如果当前高斯位于 当前处理的像素的最后一个贡献高斯之后，就跳过它
 			if (contributor >= last_contributor)
 				continue;
 
-			// Compute blending values, as before.
-            // 像之前一样计算混合值
-			const float2 xy = collected_xy[j];
-			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
-			const float4 con_o = collected_conic_opacity[j];
-			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+            // 计算α-blending值（如forward）
+			const float2 xy = collected_xy[j];  // 当前高斯中心在图像平面的 像素坐标
+			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };  // 当前处理的像素 到 当前2D高斯中心像素坐标的 位移向量
+			const float4 con_o = collected_conic_opacity[j];    // 当前高斯的 2D协方差矩阵的逆 和 不透明度，x、y、z: 分别是2D协方差逆矩阵的上半对角元素, w：不透明度
+
+            // 当前2D高斯分布的指数部分：-1/2 d^T Σ^-1 d
+            const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
 
 			const float G = exp(power);
+            // 当前高斯的 alpha = 高斯的不透明度(包含2D高斯投影分布前面的常数部分) * 2D高斯的投影分布
 			const float alpha = min(0.99f, con_o.w * G);
 			if (alpha < 1.0f / 255.0f)
 				continue;
 
-			T = T / (1.f - alpha);
-			const float dchannel_dcolor = alpha * T;
+			T = T / (1.f - alpha);  // 更新 光线经之前高斯的 剩余能量
+			const float dchannel_dcolor = alpha * T;    // 当前高斯 对渲染当前像素RGB值的贡献度
 
-			// Propagate gradients to per-Gaussian colors and keep gradients w.r.t. alpha (blending factor for a Gaussian/pixel pair).
-            // 将梯度传播到每个高斯的颜色，并保留关于alpha（高斯/像素对的混合因子）的梯度
-			float dL_dalpha = 0.0f; // 可以通过 alpha compositing 的公式，利用 chain rule 倒推各个参数的梯度。
-			const int global_id = collected_id[j];
+            // 将梯度传播到每个高斯的颜色，并保留相对于 alpha（高斯和像素对的blending因子）的梯度。
+            // 计算loss对高斯的 alpha、颜色 的梯度
+			float dL_dalpha = 0.0f;     // loss对当前高斯alpha的 梯度
+			const int global_id = collected_id[j];  // 当前高斯ID
+
+            // 从最后一个高斯开始
+            // 遍历RGB三个通道
 			for (int ch = 0; ch < C; ch++)
 			{
-				const float c = collected_colors[ch * BLOCK_SIZE + j];
-				// Update last color (to be used in the next iteration)
-                // 更新最后的颜色（用于下一次迭代）
-				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
-				last_color[ch] = c;
+				const float c = collected_colors[ch * BLOCK_SIZE + j];  // 当前高斯 某个通道的颜色值
 
-				const float dL_dchannel = dL_dpixel[ch];
+                // 更新 当前高斯及之后的所有高斯的 颜色贡献度（用于下一次迭代）
+				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+
+                last_color[ch] = c;     // 更新 当前高斯 后面的高斯 的某个通道颜色值
+
+				const float dL_dchannel = dL_dpixel[ch];    // loss对当前像素的 某个通道颜色的 梯度
 				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
-				// Update the gradients w.r.t. color of the Gaussian. 
-				// Atomic, since this pixel is just one of potentially
-				// many that were affected by this Gaussian.
-                // 更新关于高斯颜色的梯度。
-                // 使用原子操作，因为这个像素只是可能
-                // 受此高斯影响的众多像素之一
-				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+
+                // (1) 更新 loss对当前高斯 颜色 的梯度
+				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);    // atomicAdd：CUDA编程中的一种原子 加 操作，确保在并发操作时多个线程访问同一内存地址的，执行安全、准确的 加法运算。因为这个像素可能只是受此高斯影响的众多像素之一
 			}
 			dL_dalpha *= T;
-			// Update last alpha (to be used in the next iteration)
+
             //更新最后的alpha（用于下一次迭代）
 			last_alpha = alpha;
 
-			// Account for fact that alpha also influences how much of
-			// the background color is added if nothing left to blend
-            // 考虑到alpha还会影响如果没有其他内容可混合时
-            // 添加多少背景颜色的事实
+            // 考虑到alpha还会影响 添加的背景颜色（在混合完高斯的颜色后）
 			float bg_dot_dpixel = 0;
 			for (int i = 0; i < C; i++)
 				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
+
 			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
 
@@ -582,19 +583,16 @@ renderCUDA(
 			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
 			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
 
-			// Update gradients w.r.t. 2D mean position of the Gaussian
-            // 更新关于高斯的2D均值位置的梯度
+            // (2) 更新 loss对当前高斯中心 2D位置 的梯度
 			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
 			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
 
-			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-            // 更新关于2D协方差（2x2矩阵，对称）的梯度
+            // (3) 更新 loss对当前高斯的 2D协方差 的梯度
 			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
 			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
 			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
 
-			// Update gradients w.r.t. opacity of the Gaussian
-            // 更新关于高斯不透明度的梯度
+            // (4) 更新 loss对当前高斯 不透明度 的梯度
 			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
 		}
 	}
@@ -675,9 +673,9 @@ void BACKWARD::render(
 	const float* colors,    // 默认是 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float* final_Ts,  // 渲染后每个像素 pixel的 累积的透射率 的数组
 	const uint32_t* n_contrib,  // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
-	const float* dL_dpixels,    // loss对渲染的RGB图像中每个像素颜色的 梯度
+	const float* dL_dpixels,    // 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
 	float3* dL_dmean2D,     // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
-	float4* dL_dconic2D,    // 输出的 loss对所有高斯 椭圆二次型矩阵的 导数
+	float4* dL_dconic2D,    // 输出的 loss对所有高斯 2D协方差矩阵的 导数
 	float* dL_dopacity,     // 输出的 loss对所有高斯 不透明度的 导数
 	float* dL_dcolors)      // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
 {

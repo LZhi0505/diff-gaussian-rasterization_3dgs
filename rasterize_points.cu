@@ -164,7 +164,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const torch::Tensor& projmatrix,    // 观测变换*投影变换矩阵，W2NDC = W2C * C2NDC
 	const float tan_fovx,
 	const float tan_fovy,
-    const torch::Tensor& dL_dout_color, // loss对渲染的RGB图像中每个像素颜色的 梯度
+    const torch::Tensor& dL_dout_color, // 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
 	const torch::Tensor& sh,    // 所有高斯的 球谐系数，(N,16,3)
 	const int degree,   // # 当前的球谐阶数
 	const torch::Tensor& campos,    // 当前相机中心的世界坐标
@@ -216,9 +216,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
-	  dL_dout_color.contiguous().data<float>(),     // loss对渲染的RGB图像中每个像素颜色的 梯度
+	  dL_dout_color.contiguous().data<float>(),     // 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
 	  dL_dmeans2D.contiguous().data<float>(),   // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
-	  dL_dconic.contiguous().data<float>(),         // 输出的 loss对所有高斯 椭圆二次型矩阵的 导数
+	  dL_dconic.contiguous().data<float>(),         // 输出的 loss对所有高斯 2D协方差矩阵的 导数
 	  dL_dopacity.contiguous().data<float>(),   // 输出的 loss对所有高斯 不透明度的 导数
 	  dL_dcolors.contiguous().data<float>(),        // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
 	  dL_dmeans3D.contiguous().data<float>(),   // 输出的 loss对所有高斯 中心世界坐标的 导数
