@@ -152,16 +152,17 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 // Backward version of INVERSE 2D covariance matrix computation
 // (due to length launched as separate kernel before other 
 // backward steps contained in preprocess)
-__global__ void computeCov2DCUDA(int P,
-	const float3* means,
-	const int* radii,
-	const float* cov3Ds,
-	const float h_x, float h_y,
+__global__ void computeCov2DCUDA(
+    int P,      // 所有高斯的个数
+	const float3* means,    // 所有高斯 中心的世界坐标
+	const int* radii,       // 所有高斯 在图像平面上的投影半径
+	const float* cov3Ds,    // 所有高斯 在世界坐标系下的3D协方差矩阵
+	const float h_x, float h_y,     // fx, fy
 	const float tan_fovx, float tan_fovy,
-	const float* view_matrix,
-	const float* dL_dconics,
-	float3* dL_dmeans,
-	float* dL_dcov)
+	const float* view_matrix,   // 观测变换矩阵，W2C
+	const float* dL_dconics,    // 反传渲染部分计算的 loss对所有高斯 2D协方差矩阵 的梯度
+	float3* dL_dmeans,      // 输出的 loss对所有高斯 中心世界坐标 的梯度
+	float* dL_dcov)         // 输出的 loss对所有高斯 3D协方差矩阵 的梯度
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P || !(radii[idx] > 0))
@@ -356,23 +357,25 @@ __device__ void computeCov3D(int idx, const glm::vec3 scale, float mod, const gl
 // (those are handled by a previous kernel call)
 template<int C>
 __global__ void preprocessCUDA(
-	int P, int D, int M,
-	const float3* means,
-	const int* radii,
-	const float* shs,
-	const bool* clamped,
-	const glm::vec3* scales,
-	const glm::vec4* rotations,
-	const float scale_modifier,
-	const float* proj,
-	const glm::vec3* campos,
-	const float3* dL_dmean2D,
-	glm::vec3* dL_dmeans,
-	float* dL_dcolor,
-	float* dL_dcov3D,
-	float* dL_dsh,
-	glm::vec3* dL_dscale,
-	glm::vec4* dL_drot)
+	int P,      // 所有高斯的个数
+    int D,      // 当前的球谐阶数
+    int M,      // 每个高斯的球谐系数个数=16
+	const float3* means,    // 所有高斯 中心的世界坐标
+	const int* radii,       // 所有高斯 在图像平面上的投影半径
+	const float* shs,       // 所有高斯的 球谐系数，(N,16,3)
+	const bool* clamped,    // 所有高斯 是否被裁剪的标志 数组，某位置为True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
+	const glm::vec3* scales,    // 所有高斯的 缩放因子
+	const glm::vec4* rotations, // 所有高斯的 旋转四元数
+	const float scale_modifier, // 缩放因子调节系数
+	const float* proj,      // 观测变换*投影变换矩阵，W2NDC = W2C * C2NDC
+	const glm::vec3* campos,    // 当前相机中心的世界坐标
+	const float3* dL_dmean2D,   // 反传渲染部分计算的 loss对所有高斯 中心2D投影像素坐标 的梯度
+	glm::vec3* dL_dmeans,   // 输出的 loss对所有高斯 中心世界坐标 的梯度
+	float* dL_dcolor,           // 反传渲染部分计算的 loss对所有高斯 RGB颜色 的梯度
+	float* dL_dcov3D,       // 输出的 loss对所有高斯 3D协方差矩阵 的梯度
+	float* dL_dsh,          // 输出的 loss对所有高斯 球谐系数 的梯度
+	glm::vec3* dL_dscale,   // 输出的 loss对所有高斯 缩放因子 的梯度
+	glm::vec4* dL_drot)     // 输出的 loss对所有高斯 旋转四元数 的梯度
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P || !(radii[idx] > 0))
@@ -425,11 +428,11 @@ renderCUDA(
 	const float* __restrict__ colors,       // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float* __restrict__ final_Ts,     // 渲染后每个像素 pixel的 累积的透射率 的数组
 	const uint32_t* __restrict__ n_contrib,     // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
-	const float* __restrict__ dL_dpixels,   // 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
-	float3* __restrict__ dL_dmean2D,    // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
-	float4* __restrict__ dL_dconic2D,   // 输出的 loss对所有高斯 2D协方差矩阵的 导数
-	float* __restrict__ dL_dopacity,    // 输出的 loss对所有高斯 不透明度的 导数
-	float* __restrict__ dL_dcolors)     // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
+	const float* __restrict__ dL_dpixels,   // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+	float3* __restrict__ dL_dmean2D,    // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度
+	float4* __restrict__ dL_dconic2D,   // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
+	float* __restrict__ dL_dopacity,    // 输出的 loss对所有高斯 不透明度 的梯度
+	float* __restrict__ dL_dcolors)     // 输出的 loss对所有高斯 颜色 的梯度
 {
     // 重新进行光栅化计算，计算所需的块信息
     // 1. 确定当前block处理的 tile的像素范围
@@ -476,15 +479,15 @@ renderCUDA(
 	uint32_t contributor = toDo;    // 当前跟踪的高斯ID = 该tile触及的最后一个的高斯ID = 该tile触及的高斯个数
     const int last_contributor = inside ? n_contrib[pix_id] : 0;    // 从前向传播中取出 该像素穿过的高斯的个数 = 最后一个对渲染该像素RGB值 有贡献的高斯ID
 
-	float accum_rec[C] = { 0 }; // 累积的
+	float accum_rec[C] = { 0 };     // 当前高斯之后所有高斯的 渲染颜色
 
-    float dL_dpixel[C];         // loss对当前像素 RGB三个值的 梯度
+    float dL_dpixel[C];             // loss对当前像素 RGB三个值的 梯度
 	if (inside)
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];  // 取出 loss对当前像素 RGB三个值的 梯度
 
-	float last_alpha = 0;   //
-	float last_color[C] = { 0 };    //
+	float last_alpha = 0;           // 迭代记录的 后一个高斯的 不透明度
+	float last_color[C] = { 0 };    // 迭代记录的 后一个高斯的颜色
 
     // 像素坐标的梯度。归一化屏幕空间视窗坐标(-1, 1)
     // 从后面开始加载辅助数据到共享内存中，并以相反顺序加载
@@ -537,7 +540,7 @@ renderCUDA(
 			if (alpha < 1.0f / 255.0f)
 				continue;
 
-			T = T / (1.f - alpha);  // 更新 光线经之前高斯的 剩余能量
+			T = T / (1.f - alpha);  // 更新 光线到当前高斯剩余的能量
 			const float dchannel_dcolor = alpha * T;    // 当前高斯 对渲染当前像素RGB值的贡献度
 
             // 将梯度传播到每个高斯的颜色，并保留相对于 alpha（高斯和像素对的blending因子）的梯度。
@@ -545,29 +548,30 @@ renderCUDA(
 			float dL_dalpha = 0.0f;     // loss对当前高斯alpha的 梯度
 			const int global_id = collected_id[j];  // 当前高斯ID
 
-            // 从最后一个高斯开始
-            // 遍历RGB三个通道
+            // 遍历当前高斯的RGB三个通道，分别计算
 			for (int ch = 0; ch < C; ch++)
 			{
-				const float c = collected_colors[ch * BLOCK_SIZE + j];  // 当前高斯 某个通道的颜色值
+				const float c = collected_colors[ch * BLOCK_SIZE + j];  // 当前高斯某个通道的 颜色值
 
-                // 更新 当前高斯及之后的所有高斯的 颜色贡献度（用于下一次迭代）
-				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+                // 更新 当前高斯之后所有高斯的 渲染颜色（用于下一次迭代）
+				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];   // = 后一个高斯的不透明度 * 后一个高斯的颜色 + (1 - 后一个高斯的不透明度) * 后一个高斯之后所有高斯的 颜色
 
-                last_color[ch] = c;     // 更新 当前高斯 后面的高斯 的某个通道颜色值
+                last_color[ch] = c;     // 更新 后一个高斯的 颜色（用于下一次迭代）
 
-				const float dL_dchannel = dL_dpixel[ch];    // loss对当前像素的 某个通道颜色的 梯度
+				const float dL_dchannel = dL_dpixel[ch];    // loss对当前像素某个通道颜色的 梯度
+
+                // (1) 累加三个通道的 loss对当前高斯 最终不透明度 的梯度
 				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
 
-                // (1) 更新 loss对当前高斯 颜色 的梯度
+                // (2) 更新 loss对当前高斯 颜色 的梯度
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);    // atomicAdd：CUDA编程中的一种原子 加 操作，确保在并发操作时多个线程访问同一内存地址的，执行安全、准确的 加法运算。因为这个像素可能只是受此高斯影响的众多像素之一
 			}
 			dL_dalpha *= T;
 
-            //更新最后的alpha（用于下一次迭代）
+            // 更新 后一个高斯的 不透明度（用于下一次迭代）
 			last_alpha = alpha;
 
-            // 考虑到alpha还会影响 添加的背景颜色（在混合完高斯的颜色后）
+            // 在混合完所有高斯的颜色后，不透明度alpha还会影响 添加的背景颜色，因此还需计算对alpha的梯度还需考虑背景部分
 			float bg_dot_dpixel = 0;
 			for (int i = 0; i < C; i++)
 				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
@@ -575,52 +579,53 @@ renderCUDA(
 			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
 
-			// Helpful reusable temporary variables
             // 有用的可重用临时变量
-			const float dL_dG = con_o.w * dL_dalpha;
+			const float dL_dG = con_o.w * dL_dalpha;    // loss对当前高斯 2D投影分布 的梯度
 			const float gdx = G * d.x;
 			const float gdy = G * d.y;
 			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
 			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
 
-            // (2) 更新 loss对当前高斯中心 2D位置 的梯度
+            // (3) 更新 loss对当前高斯中心 2D投影坐标 的梯度
 			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
 			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
 
-            // (3) 更新 loss对当前高斯的 2D协方差 的梯度
+            // (4) 更新 loss对当前高斯的 2D协方差矩阵 的梯度
 			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
 			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
 			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
 
-            // (4) 更新 loss对当前高斯 不透明度 的梯度
+            // (5) 更新 loss对当前高斯 不透明度 的梯度
 			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
 		}
 	}
 }
 
 void BACKWARD::preprocess(
-	int P, int D, int M,
-	const float3* means3D,
-	const int* radii,
-	const float* shs,
-	const bool* clamped,
-	const glm::vec3* scales,
-	const glm::vec4* rotations,
-	const float scale_modifier,
-	const float* cov3Ds,
-	const float* viewmatrix,
-	const float* projmatrix,
+	int P,      // 所有高斯的个数
+    int D,      // 当前的球谐阶数
+    int M,      // 每个高斯的球谐系数个数=16
+	const float3* means3D,      // 所有高斯 中心的世界坐标
+	const int* radii,           // 所有高斯 在图像平面上的投影半径
+	const float* shs,           // 所有高斯的 球谐系数，(N,16,3)
+	const bool* clamped,        // 所有高斯 是否被裁剪的标志 数组，某位置为True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
+	const glm::vec3* scales,        // 所有高斯的 缩放因子
+	const glm::vec4* rotations,     // 所有高斯的 旋转四元数
+	const float scale_modifier,     // 缩放因子调节系数
+	const float* cov3Ds,        // 所有高斯 在世界坐标系下的3D协方差矩阵
+	const float* viewmatrix,    // 观测变换矩阵，W2C
+	const float* projmatrix,    // 观测变换*投影变换矩阵，W2NDC = W2C * C2NDC
 	const float focal_x, float focal_y,
 	const float tan_fovx, float tan_fovy,
-	const glm::vec3* campos,
-	const float3* dL_dmean2D,
-	const float* dL_dconic,
-	glm::vec3* dL_dmean3D,
-	float* dL_dcolor,
-	float* dL_dcov3D,
-	float* dL_dsh,
-	glm::vec3* dL_dscale,
-	glm::vec4* dL_drot)
+	const glm::vec3* campos,    // 当前相机中心的世界坐标
+	const float3* dL_dmean2D,   // 反传渲染部分计算的 loss对所有高斯 中心2D投影像素坐标 的梯度
+	const float* dL_dconic,     // 反传渲染部分计算的 loss对所有高斯 2D协方差矩阵 的梯度
+	glm::vec3* dL_dmean3D,  // 输出的 loss对所有高斯 中心世界坐标 的梯度
+	float* dL_dcolor,           // 反传渲染部分计算的 loss对所有高斯 RGB颜色 的梯度
+	float* dL_dcov3D,       // 输出的 loss对所有高斯 3D协方差矩阵 的梯度
+	float* dL_dsh,          // 输出的 loss对所有高斯 球谐系数 的梯度
+	glm::vec3* dL_dscale,   // 输出的 loss对所有高斯 缩放因子 的梯度
+	glm::vec4* dL_drot)     // 输出的 loss对所有高斯 旋转四元数 的梯度
 {
     // 传播用于2D圆锥矩阵计算路径的梯度。
     // 由于过程较长，因此它有自己的内核，而不是作为“预处理”的一部分。

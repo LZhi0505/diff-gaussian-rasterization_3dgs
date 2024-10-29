@@ -305,7 +305,7 @@ int CudaRasterizer::Rasterizer::forward(
 	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);    // 用显存块首地址作为参数，调用 fromChunk函数为 GeometryState geo申请显存
 
 	if (radii == nullptr) {
-        // 如果传入的、要输出的 高斯在图像平面的投影半径 为空指针，则将其设为 geomState缓存的投影半径
+        // 如果传入的、要输出的 高斯在图像平面的投影半径 为空指针，则将其设为 geomState缓存的 所有高斯在图像平面上的投影半径
 		radii = geomState.internal_radii;
 	}
 
@@ -470,16 +470,16 @@ void CudaRasterizer::Rasterizer::backward(
 	char* geom_buffer,  // 存储所有高斯 几何数据的 tensor：包括2D中心像素坐标、相机坐标系下的深度、3D协方差矩阵等
 	char* binning_buffer,   // 存储所有高斯 排序数据的 tensor：包括未排序和排序后的 所有高斯覆盖的tile的 keys、values列表
 	char* img_buffer,       // 存储所有高斯 渲染后数据的 tensor：包括累积的透射率、最后一个贡献的高斯ID
-	const float* dL_dpix,   // 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
-	float* dL_dmean2D,  // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
-	float* dL_dconic,   // 输出的 loss对所有高斯 2D协方差矩阵的 导数
-	float* dL_dopacity, // 输出的 loss对所有高斯 不透明度的 导数
-	float* dL_dcolor,   // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
-	float* dL_dmean3D,  // 输出的 loss对所有高斯 中心世界坐标的 导数
-	float* dL_dcov3D,   // 输出的 loss对所有高斯 3D协方差矩阵的 导数
-	float* dL_dsh,      // 输出的 loss对所有高斯 球谐系数的 导数
-	float* dL_dscale,   // 输出的 loss对所有高斯 缩放因子的 导数
-	float* dL_drot,     // 输出的 loss对所有高斯 旋转四元数的 导数
+	const float* dL_dpix,   // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+	float* dL_dmean2D,  // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度
+	float* dL_dconic,   // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
+	float* dL_dopacity, // 输出的 loss对所有高斯 不透明度 的梯度
+	float* dL_dcolor,   // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 的梯度
+	float* dL_dmean3D,  // 输出的 loss对所有高斯 中心世界坐标 的梯度
+	float* dL_dcov3D,   // 输出的 loss对所有高斯 3D协方差矩阵 的梯度
+	float* dL_dsh,      // 输出的 loss对所有高斯 球谐系数 的梯度
+	float* dL_dscale,   // 输出的 loss对所有高斯 缩放因子 的梯度
+	float* dL_drot,     // 输出的 loss对所有高斯 旋转四元数 的梯度
 	bool debug) // 默认为False
 {
     // 这些缓冲区都是在前向传播的时候存下来的，现在拿出来用
@@ -488,7 +488,7 @@ void CudaRasterizer::Rasterizer::backward(
 	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
 
 	if (radii == nullptr) {
-        // 如果传入的 所有高斯投影在当前相机图像平面上的最大半径数组为 空指针，则从geomState缓冲区中获取
+        // 如果传入的 所有高斯投影在当前相机图像平面上的最大半径数组为 空指针，则从geomState缓冲区中获取 所有高斯在图像平面上的投影半径
 		radii = geomState.internal_radii;
 	}
 
@@ -515,40 +515,46 @@ void CudaRasterizer::Rasterizer::backward(
 		color_ptr,      // 默认是 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 		imgState.accum_alpha,   // 渲染后每个像素 pixel的 累积的透射率 的数组
 		imgState.n_contrib,     // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
-		dL_dpix,    // 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
-		(float3*)dL_dmean2D,    // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
-		(float4*)dL_dconic,     // 输出的 loss对所有高斯 2D协方差矩阵的 导数
-		dL_dopacity,            // 输出的 loss对所有高斯 不透明度的 导数
-		dL_dcolor),     // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
+		dL_dpix,    // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+		(float3*)dL_dmean2D,    // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度
+		(float4*)dL_dconic,     // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
+		dL_dopacity,            // 输出的 loss对所有高斯 不透明度 的梯度
+		dL_dcolor),     // 输出的 loss对所有高斯 RGB颜色 的梯度
         debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
 	// use the one we computed ourselves.
     // 处理预处理的剩余部分
+    // 如果传入的预计算3D协方差矩阵 不是空指针，则是预计算的3D协方差矩阵
+    //                         是空指针（默认），则是 preprocess中计算的 所有高斯 在世界坐标系下的3D协方差矩阵
 	const float* cov3D_ptr = (cov3D_precomp != nullptr) ? cov3D_precomp : geomState.cov3D;
 
     //! 反传中的 预处理 部分：
-	CHECK_CUDA(BACKWARD::preprocess(P, D, M,
-		(float3*)means3D,
-		radii,
-		shs,
-		geomState.clamped,
-		(glm::vec3*)scales,
-		(glm::vec4*)rotations,
-		scale_modifier,
-		cov3D_ptr,
-		viewmatrix,
-		projmatrix,
+	CHECK_CUDA(BACKWARD::preprocess(
+        P,      // 所有高斯的个数
+        D,      // 当前的球谐阶数
+        M,      // 每个高斯的球谐系数个数=16
+		(float3*)means3D,   // 所有高斯 中心的世界坐标
+		radii,      // 所有高斯 在图像平面上的投影半径
+		shs,        // 所有高斯的 球谐系数，(N,16,3)
+		geomState.clamped,      // 所有高斯 是否被裁剪的标志 数组，某位置为True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
+		(glm::vec3*)scales,     // 所有高斯的 缩放因子
+		(glm::vec4*)rotations,  // 所有高斯的 旋转四元数
+		scale_modifier,     // 缩放因子调节系数
+		cov3D_ptr,      // 所有高斯 在世界坐标系下的3D协方差矩阵
+		viewmatrix,     // 观测变换矩阵，W2C
+		projmatrix,     // 观测变换*投影变换矩阵，W2NDC = W2C * C2NDC
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
-		(glm::vec3*)campos,
-		(float3*)dL_dmean2D,
-		dL_dconic,
-		(glm::vec3*)dL_dmean3D,
-		dL_dcolor,
-		dL_dcov3D,
-		dL_dsh,
-		(glm::vec3*)dL_dscale,
-		(glm::vec4*)dL_drot), debug)
+		(glm::vec3*)campos,     // 当前相机中心的世界坐标
+		(float3*)dL_dmean2D,    // 反传渲染部分计算的 loss对所有高斯 中心2D投影像素坐标 的梯度
+		dL_dconic,              // 反传渲染部分计算的 loss对所有高斯 2D协方差矩阵 的梯度
+		(glm::vec3*)dL_dmean3D,     // 输出的 loss对所有高斯 中心世界坐标 的梯度
+		dL_dcolor,           // 反传渲染部分计算的 loss对所有高斯 RGB颜色 的梯度
+		dL_dcov3D,          // 输出的 loss对所有高斯 3D协方差矩阵 的梯度
+		dL_dsh,             // 输出的 loss对所有高斯 球谐系数 的梯度
+		(glm::vec3*)dL_dscale,      // 输出的 loss对所有高斯 缩放因子 的梯度
+		(glm::vec4*)dL_drot),       // 输出的 loss对所有高斯 旋转四元数 的梯度
+        debug)
 }
