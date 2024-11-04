@@ -321,19 +321,28 @@ __global__ void preprocessCUDA(
  * 每个线程在 读取数据(把数据从公用显存拉到 block自己的显存) 和 进行计算 之间来回切换，使得线程们可以共同读取高斯数据，这样做的原因是block共享显存比公共显存快得多
  * @tparam CHANNELS = 3，即RGB三个通道
  */
-template <uint32_t CHANNELS>
+template <uint32_t CHANNELS, uint32_t ALL_MAP>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)    // CUDA 启动核函数时使用的线程格和线程块的数量
 renderCUDA(
 	const uint2* __restrict__ ranges,   // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 	const uint32_t* __restrict__ point_list,    // 排序后的 values列表，每个元素是按（大顺序：各tile_ID，小顺序：落在该tile内各高斯的深度）排序后的 高斯ID
 	int W, int H,
+    const float focal_x, const float focal_y,
+    const float cx, const float cy,
+    const float* __restrict__ viewmatrix,   // 观测变换矩阵，W2C
+    const float* __restrict__ cam_pos,      // 当前相机中心的世界坐标
 	const float2* __restrict__ points_xy_image, // 所有高斯 中心在当前相机图像平面的二维坐标 的数组
 	const float* __restrict__ features,         // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
+    const float* __restrict__ all_map,      // 输入的 5通道tensor，[0-2]: 当前相机坐标系下所有高斯的法向量，即最短轴向量；[3]: 全1.0；[4]: 相机光心 到 所有高斯法向量垂直平面的 距离
 	const float4* __restrict__ conic_opacity,   // 所有高斯 2D协方差矩阵的逆 和 不透明度 的数组
 	float* __restrict__ final_T,                // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
 	uint32_t* __restrict__ n_contrib,           // 输出的 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 	const float* __restrict__ bg_color,         // 提供的背景颜色，默认为[0,0,0]，黑色
-	float* __restrict__ out_color)              // 输出的 RGB图像（加上了背景颜色）
+	float* __restrict__ out_color,          // 输出的 RGB图像（加上了背景颜色）
+    int* __restrict__ out_observe,          // 输出的 所有高斯 渲染时在透射率>0.5之前 对某像素有贡献的 像素个数
+    float* __restrict__ out_all_map,        // 输出的 5通道tensor，[0-2]：渲染的法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离
+    float* __restrict__ out_plane_depth,    // 输出的 无偏深度图（相机坐标系）
+    const bool render_geo)      // 是否要渲染 深度图和法向量图的标志，默认为False
 {
     // 1. 确定当前block处理的 tile的像素范围
 	auto block = cg::this_thread_block();   // 获取当前线程所处的 block（对应一个 tile）
@@ -348,6 +357,8 @@ renderCUDA(
 
     uint32_t pix_id = W * pix.y + pix.x;        // 当前处理的 像素 在像素平面的　索引
 	float2 pixf = { (float)pix.x, (float)pix.y };   // 当前处理的 像素 在像素平面的坐标(float)
+
+    const float2 ray = { (pixf.x - cx) / focal_x, (pixf.y - cy) / focal_y };    // 当前处理的 像素 在Z=1平面的 坐标
 
     // 2. 判断当前线程处理的 像素 是否在图像有效像素范围内
 	bool inside = pix.x < W　&& pix.y < H;
@@ -372,6 +383,7 @@ renderCUDA(
 	uint32_t contributor = 0;       // 记录当前处理的像素穿过的高斯个数 = 对渲染当前像素RGB值 最后一个有贡献的高斯ID
 	uint32_t last_contributor = 0;  // 存储最终经过的高斯球数量
 	float C[CHANNELS] = { 0 };      // 最后渲染的颜色
+    float All_map[ALL_MAP] = { 0 }; // 包含：渲染的法向量（相机坐标系）、每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度、相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离
 
     // 6. 遍历当前tile触及的高斯
     // 外循环：迭代分批渲染任务，每批最多处理 BLOCK_SIZE = 16*16个高斯
@@ -407,9 +419,6 @@ renderCUDA(
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };    // 当前处理的像素 到 当前2D高斯中心像素坐标的 位移向量
 			float4 con_o = collected_conic_opacity[j];          // 当前高斯的 2D协方差矩阵的逆 和 不透明度，x、y、z: 分别是2D协方差逆矩阵的上半对角元素, w：不透明度
 
-            // 另：一个高斯对渲染某个像素的贡献度 = 光线经之前高斯后剩余的能量 * 该高斯对光线的吸收程度
-            //                             = 光线经之前高斯累积的透射率 T * 当前高斯的alpha（该高斯的不透明度 * 其2D高斯的投影分布）
-
             // (1) 计算 当前高斯对光线的吸收程度 alpha（3DGS论文公式(2)中的α值）
             // 当前2D高斯分布的指数部分：-1/2 d^T Σ^-1 d
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
@@ -430,10 +439,27 @@ renderCUDA(
 				continue;
 			}
 
+            // 一个高斯对渲染某个像素的贡献度 = 光线经之前高斯后剩余的能量 * 该高斯对光线的吸收程度
+            //                           = 光线经之前高斯累积的透射率 T * 当前高斯的alpha
+            const float aT = alpha * T
+
             // (3) α-blending计算当前像素的RGB三通道 颜色值 C（3DGS论文公式(3)）
 			for (int ch = 0; ch < CHANNELS; ch++)
                 // 每个通道的颜色 = 累加 当前高斯的颜色 * 当前高斯的贡献度
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+				C[ch] += features[collected_id[j] * CHANNELS + ch] * aT;
+
+            // (4) 若需要渲染 深度图和法向量图，则计算α-blending后的All_map：[0-2] 该像素的法向量（相机坐标系）；[3]：对渲染当前像素有贡献的 所有高斯的贡献度；[4]：当前相机光心 到 该像素穿过的所有高斯法向量垂直平面的 距离
+            if (render_geo)
+            {
+                for (int ch = 0; ch < ALL_MAP; ch++)
+                    All_map[ch] += all_map[collected_id[j] * ALL_MAP + ch] * aT;
+            }
+
+            // 若透射率 > 0.5，则累加 当前高斯覆盖的 像素个数
+            if (T > 0.5)
+            {
+                atomicAdd(&(out_observe[collected_id[j]]), 1);
+            }
 
 			T = test_T; // 更新经之前高斯累积的透射率
 
@@ -453,6 +479,17 @@ renderCUDA(
         // 最后输出的RGB颜色值 加上 背景颜色
         for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+
+        // 若需要渲染 深度图和法向量图，则
+        if (render_geo)
+        {
+            // 渲染 All_map：[0-2] 该像素的法向量（相机坐标系）、[3]：对渲染当前像素有贡献的 所有高斯的贡献度、[4]：当前相机光心 到 该像素穿过的所有高斯法向量垂直平面的 距离
+            for (int ch = 0; ch < ALL_MAP; ch++)
+                out_all_map[ch * H * W + pix_id] = All_map[ch];
+
+            // 计算 该像素的 无偏深度（相机坐标系） = 相机光心到高斯法向量垂直平面的距离 / cosθ（当前像素在Z=1平面的坐标 投影到 法向量上）
+            out_plane_depth[pix_id] = All_map[4] / -(All_map[0] * ray.x + All_map[1] * ray.y + All_map[2] + 1.0e-8);
+        }
 	}
 }
 
@@ -463,29 +500,47 @@ void FORWARD::render(
 	const uint2* ranges,        // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 	const uint32_t* point_list, // 按 tile ID、高斯深度 排序后的 values列表，即 高斯ID 列表
 	int W, int H,
+    const float focal_x, const float focal_y,
+    const float cx, const float cy,
+    const float* viewmatrix,    // 观测变换矩阵，W2C
+    const float* cam_pos,       // 当前相机中心的世界坐标
 	const float2* means2D,  // 已计算的 所有高斯 中心在当前相机图像平面的二维坐标
 	const float* colors,    // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
+    const float* all_map,   // 输入的 5通道tensor，[0-2]: 当前相机坐标系下所有高斯的法向量，即最短轴向量；[3]: 全1.0；[4]: 相机光心 到 所有高斯法向量垂直平面的 距离
 	const float4* conic_opacity,    // 已计算的 所有高斯 2D协方差矩阵的逆 和 不透明度
 	float* final_T,         // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
 	uint32_t* n_contrib,    // 输出的 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 	const float* bg_color,  // 背景颜色，默认为[0,0,0]，黑色
-	float* out_color)       // 输出的 RGB图像（加上了背景颜色）
+	float* out_color,           // 输出的 RGB图像（加上了背景颜色）
+    int* out_observe,           // 输出的 所有高斯 渲染时在透射率>0.5之前 对某像素有贡献的 像素个数
+    float* out_all_map,         // 输出的 5通道tensor，[0-2]：渲染的法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离
+    float* out_plane_depth,     // 输出的 无偏深度图
+    const bool render_geo)  // 是否要渲染 深度图和法向量图的标志，默认为False
 {
     // 开始进入CUDA并行计算，将图像分为多个线程块（分配一个 进程）；每个线程块为每个像素分配一个线程；
     // 对于每个block只排序一次，认为block里面的pixel都被block中的所有gaussian影响且顺序一样。
     // 在forward中，沿camera从前往后遍历gaussian，计算颜色累计值和透明度累计值，直到透明度累计超过1或者遍历完成，然后用背景色和颜色累计值和透明度累计值计算这个pixel的最终颜色。
     // 在backward中，遍历顺序与forward相反，从（之前记录下来的）最终透明度累计值和其对应的最后一个gaussian开始，从后往前算梯度。
-	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
+	renderCUDA<NUM_CHANNELS, NUM_ALL_MAP> << <grid, block >> > (
 		ranges,
 		point_list,
 		W, H,
+        focal_x, focal_y,
+        cx, cy,
+        viewmatrix,
+        cam_pos,
 		means2D,
 		colors,
+        all_map,
 		conic_opacity,
 		final_T,
 		n_contrib,
 		bg_color,
-		out_color);
+		out_color,
+        out_observe,
+        out_all_map,
+        out_plane_depth,
+        render_geo);
 }
 
 /**

@@ -417,7 +417,7 @@ __global__ void preprocessCUDA(
  * 反向传播中的 渲染
  * @tparam C = 3，即RGB三个通道
  */
-template <uint32_t C>
+template <uint32_t C, uint32_t MAP_N>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,   // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
@@ -427,13 +427,20 @@ renderCUDA(
 	const float2* __restrict__ points_xy_image,     // 所有高斯 中心在当前相机图像平面的二维坐标 数组
 	const float4* __restrict__ conic_opacity,       // 所有高斯 2D协方差的逆 和 不透明度 数组
 	const float* __restrict__ colors,       // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
+    const float* __restrict__ all_maps,     // 输入的 5通道tensor，[0-2]: 当前相机坐标系下所有高斯的法向量，即最短轴向量；[3]: 全1.0；[4]: 相机光心 到 所有高斯法向量垂直平面的 距离
+    const float* __restrict__ all_map_pixels,   // forward输出的 5通道tensor，[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离
 	const float* __restrict__ final_Ts,     // 渲染后每个像素 pixel的 累积的透射率 的数组
 	const uint32_t* __restrict__ n_contrib,     // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 	const float* __restrict__ dL_dpixels,   // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+    const float* __restrict__ dL_dout_all_maps,     // 输入的 loss对forward输出的 5通道tensor（[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离）的梯度
+    const float* __restrict__ dL_dout_plane_depths, // 输入的 loss对渲染的无偏深度图 的梯度
 	float3* __restrict__ dL_dmean2D,    // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度
+    float3* __restrict__ dL_dmean2D_abs,    // 输出的
 	float4* __restrict__ dL_dconic2D,   // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
 	float* __restrict__ dL_dopacity,    // 输出的 loss对所有高斯 不透明度 的梯度
-	float* __restrict__ dL_dcolors)     // 输出的 loss对所有高斯 颜色 的梯度
+	float* __restrict__ dL_dcolors,     // 输出的 loss对所有高斯 颜色 的梯度
+    float* __restrict__ dL_dall_map,    // 输出的
+    const bool render_geo)      // 是否要渲染 深度图和法向量图的标志，默认为False
 {
     // 重新进行光栅化计算，计算所需的块信息
     // 1. 确定当前block处理的 tile的像素范围
@@ -449,6 +456,8 @@ renderCUDA(
 
     const uint32_t pix_id = W * pix.y + pix.x;  // 当前处理的 像素 在像素平面的　索引
 	const float2 pixf = { (float)pix.x, (float)pix.y }; // 当前处理的 像素 在像素平面的坐标(float)
+
+    const float2 ray = { (pixf.x - W * 0.5) / fx, (pixf.y - H * 0.5) / fy };    // 当前处理的 像素 在Z=1平面的 坐标
 
     // 2. 判断当前处理的 像素 是否在图像有效像素范围内
 	const bool inside = pix.x < W && pix.y < H;
@@ -468,6 +477,7 @@ renderCUDA(
 	__shared__ float2 collected_xy[BLOCK_SIZE]; // 记录各线程处理的 高斯中心在当前相机图像平面的 像素坐标
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];  // 记录各线程处理的 高斯的 2D协方差矩阵的 逆 和 不透明度
 	__shared__ float collected_colors[C * BLOCK_SIZE];      // 记录各线程处理的 高斯 在当前相机中心的观测方向下 的RGB三个值
+    __shared__ float collected_all_maps[MAP_N * BLOCK_SIZE];
 
     //! 核心：根据α-blending的公式，手推每个变量的反向传播公式，推导过程可参考论文里的附录
 
@@ -481,14 +491,43 @@ renderCUDA(
     const int last_contributor = inside ? n_contrib[pix_id] : 0;    // 从前向传播中取出 该像素穿过的高斯的个数 = 最后一个对渲染该像素RGB值 有贡献的高斯ID
 
 	float accum_rec[C] = { 0 };     // 当前高斯之后所有高斯的 渲染颜色
+    float accum_all_map[MAP_N] = { 0 };
 
     float dL_dpixel[C];             // loss对当前像素 RGB三个值的 梯度
+    float dL_dout_all_map[MAP_N];   // loss对
+    // float grad_sum = 0;
+
 	if (inside)
-		for (int i = 0; i < C; i++)
-			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];  // 取出 loss对当前像素 RGB三个值的 梯度
+    {
+        // 取出 loss对当前像素 RGB三个值的 梯度
+        for (int i = 0; i < C; i++)
+        {
+            dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+            // grad_sum += fabs(dL_dpixel[i]);
+        }
+
+        if(render_geo)
+        {
+            // loss对forward输出的 5通道tensor（[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离）的梯度
+            for (int i = 0; i < MAP_N; i++)
+            {
+                dL_dout_all_map[i] = dL_dout_all_maps[i * H * W + pix_id];
+                // grad_sum += fabs(dL_dout_all_map[i]);
+            }
+
+            const float3 normal = {all_map_pixels[pix_id], all_map_pixels[H * W + pix_id], all_map_pixels[2 * H * W + pix_id]};     // 当前像素的 法向量
+            const float distance = all_map_pixels[4 * H * W + pix_id];  // 相机光心 到 当前像素穿过的所有高斯法向量垂直平面的 距离
+            const float tmp = (normal.x * ray.x + normal.y * ray.y + normal.z + 1.0e-8);    // cosθ = 当前像素在Z=1平面的坐标 投影到 法向量上
+            dL_dout_all_map[MAP_N-1] += (-dL_dout_plane_depths[pix_id] / tmp);      // loss对相机光心到高斯法向量垂直平面距离 的梯度
+            dL_dout_all_map[0] += dL_dout_plane_depths[pix_id] * (distance / (tmp * tmp) * ray.x);  // loss对法向量 的梯度
+            dL_dout_all_map[1] += dL_dout_plane_depths[pix_id] * (distance / (tmp * tmp) * ray.y);
+            dL_dout_all_map[2] += dL_dout_plane_depths[pix_id] * (distance / (tmp * tmp));
+        }
+    }
 
 	float last_alpha = 0;           // 迭代记录的 后一个高斯的 不透明度
 	float last_color[C] = { 0 };    // 迭代记录的 后一个高斯的颜色
+    float last_all_map[MAP_N] = { 0 };
 
     // 像素坐标的梯度。归一化屏幕空间视窗坐标(-1, 1)
     // 从后面开始加载辅助数据到共享内存中，并以相反顺序加载
@@ -513,6 +552,12 @@ renderCUDA(
 
             for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];   // 当前线程处理的 高斯 在当前相机中心的观测方向下 的RGB三个值
+
+            if (render_geo)
+            {
+                for (int i = 0; i < MAP_N; i++)
+                    collected_all_maps[i * BLOCK_SIZE + block.thread_rank()] = all_maps[coll_id * MAP_N + i];   // [0-2]: 当前线程处理的 高斯 的法向量（相机坐标系）；[3]: 全1.0；[4]: 相机光心 到 当前高斯法向量垂直平面的 距离
+            }
 		}
 		block.sync();
 
@@ -567,6 +612,24 @@ renderCUDA(
                 // (2) 更新 loss对当前高斯 颜色 的梯度
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);    // atomicAdd：CUDA编程中的一种原子 加 操作，确保在并发操作时多个线程访问同一内存地址的，执行安全、准确的 加法运算。因为这个像素可能只是受此高斯影响的众多像素之一
 			}
+
+            if (render_geo)
+            {
+                for (int ch = 0; ch < MAP_N; ch++)
+                {
+                    const float c = collected_all_maps[ch * BLOCK_SIZE + j];
+                    // Update last color (to be used in the next iteration)
+                    accum_all_map[ch] = last_alpha * last_all_map[ch] + (1.f - last_alpha) * accum_all_map[ch];
+                    last_all_map[ch] = c;
+
+                    const float dL_dchannel = dL_dout_all_map[ch];
+                    dL_dalpha += (c - accum_all_map[ch]) * dL_dchannel;
+                    // Update the gradients w.r.t. color of the Gaussian.
+                    // Atomic, since this pixel is just one of potentially
+                    // many that were affected by this Gaussian.
+                    atomicAdd(&(dL_dall_map[global_id * MAP_N + ch]), dchannel_dcolor * dL_dchannel);
+                }
+            }
 			dL_dalpha *= T;
 
             // 更新 后一个高斯的 不透明度（用于下一次迭代）
@@ -590,6 +653,9 @@ renderCUDA(
             // (3) 更新 loss对当前高斯中心 2D投影坐标 的梯度
 			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
 			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+
+            atomicAdd(&dL_dmean2D_abs[global_id].x, fabs(dL_dG * dG_ddelx * ddelx_dx));
+            atomicAdd(&dL_dmean2D_abs[global_id].y, fabs(dL_dG * dG_ddely * ddely_dy));
 
             // (4) 更新 loss对当前高斯的 2D协方差矩阵 的梯度
 			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
@@ -673,33 +739,49 @@ void BACKWARD::render(
 	const uint2* ranges,    // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数
 	const uint32_t* point_list, // 按深度排序后的 所有高斯覆盖的tile的 values列表，每个元素是 对应高斯的ID
 	int W, int H,
+    float fx, float fy,
 	const float* bg_color,  // 背景颜色，默认为[0,0,0]，黑色
 	const float2* means2D,  // 所有高斯 中心投影在当前相机图像平面的二维坐标 数组
 	const float4* conic_opacity,    // 所有高斯 2D协方差的逆 和 不透明度 数组
 	const float* colors,    // 默认是 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
+    const float* all_maps,      // 输入的 5通道tensor，[0-2]: 当前相机坐标系下所有高斯的法向量，即最短轴向量；[3]: 全1.0；[4]: 相机光心 到 所有高斯法向量垂直平面的 距离
+    const float* all_map_pixels,    // forward输出的 5通道tensor，[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离
 	const float* final_Ts,  // 渲染后每个像素 pixel的 累积的透射率 的数组
 	const uint32_t* n_contrib,  // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 	const float* dL_dpixels,    // 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+    const float* dL_dout_all_map,       // 输入的 loss对forward输出的 5通道tensor 的梯度
+    const float* dL_dout_plane_depth,   // 输入的 loss对渲染的无偏深度图 的梯度
 	float3* dL_dmean2D,     // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
+    float3* dL_dmean2D_abs, // 输出的
 	float4* dL_dconic2D,    // 输出的 loss对所有高斯 2D协方差矩阵的 导数
 	float* dL_dopacity,     // 输出的 loss对所有高斯 不透明度的 导数
-	float* dL_dcolors)      // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
+	float* dL_dcolors,      // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
+    float* dL_dall_map,     // 输出的
+    const bool render_geo)  // 是否要渲染 深度图和法向量图的标志，默认为False
 {
     // 调用CUDA内核函数执行光栅化过程
-	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
+	renderCUDA<NUM_CHANNELS, NUM_ALL_MAP> << <grid, block >> >(
 		ranges,
 		point_list,
 		W, H,
+        fx, fy,
 		bg_color,
 		means2D,
 		conic_opacity,
 		colors,
+        all_maps,
+        all_map_pixels,
 		final_Ts,
 		n_contrib,
 		dL_dpixels,
+        dL_dout_all_map,
+        dL_dout_plane_depth,
 		dL_dmean2D,
+        dL_dmean2D_abs,
 		dL_dconic2D,
 		dL_dopacity,
-		dL_dcolors
+		dL_dcolors,
+        dL_dall_map,
+        render_geo
 		);
 }

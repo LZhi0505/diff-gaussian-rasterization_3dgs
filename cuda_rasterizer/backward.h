@@ -25,17 +25,25 @@ namespace BACKWARD
 		const uint2* ranges,
 		const uint32_t* point_list,
 		int W, int H,
+		float fx, float fy,
 		const float* bg_color,
 		const float2* means2D,
 		const float4* conic_opacity,
 		const float* colors,
+		const float* all_maps,
+		const float* all_map_pixels,
 		const float* final_Ts,
 		const uint32_t* n_contrib,
 		const float* dL_dpixels,
+		const float* dL_dout_all_map,
+		const float* dL_dout_plane_depth,
 		float3* dL_dmean2D,
+		float3* dL_dmean2D_abs,
 		float4* dL_dconic2D,
 		float* dL_dopacity,
-		float* dL_dcolors);
+		float* dL_dcolors,
+		float* dL_dall_map,
+		const bool render_geo);
 
 	void preprocess(
 		int P, int D, int M,

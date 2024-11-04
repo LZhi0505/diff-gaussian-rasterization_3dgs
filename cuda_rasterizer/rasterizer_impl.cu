@@ -286,6 +286,7 @@ int CudaRasterizer::Rasterizer::forward(
 	const float scale_modifier, // 缩放因子的调整系数
 	const float* rotations,     // 所有高斯的 旋转四元数
 	const float* cov3D_precomp, // 因预计算的3D协方差矩阵默认是空tensor，则其传入的是一个 NULL指针
+    const float* all_map,       // 输入的 5通道tensor，[0-2]: 当前相机坐标系下所有高斯的法向量，即最短轴向量；[3]: 全1.0；[4]: 相机光心 到 所有高斯法向量垂直平面的 距离
 	const float* viewmatrix,    // 观测变换矩阵，W2C
 	const float* projmatrix,    // 观测变换矩阵 * 投影变换矩阵，W2NDC = W2C * C2NDC
 	const float* cam_pos,       // 当前相机中心的世界坐标
@@ -293,6 +294,10 @@ int CudaRasterizer::Rasterizer::forward(
 	const bool prefiltered,     // 预滤除的标志，默认为False
 	float* out_color,       // 输出的 RGB图像，考虑了背景颜色，(3,H,W)
 	int* radii,             // 输出的 所有高斯 投影在当前相机图像平面的最大半径 数组，(N,)
+    int* out_observe,       // 输出的 所有高斯 渲染时在透射率>0.5之前 对某像素有贡献的 像素个数 数组，(N,)
+    float* out_all_map,     // 输出的 5通道tensor，[0-2]：渲染的法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离
+    float* out_plane_depth, // 输出的 无偏深度图（相机坐标系）
+    const bool render_geo,  // 是否要渲染 深度图和法向量图的标志，默认为False
 	bool debug)     // 默认为False
 {
     // 1. 计算焦距，W = 2fx * tan(Fovx/2) ==> fx = W / (2 * tan(Fovx/2))
@@ -432,13 +437,22 @@ int CudaRasterizer::Rasterizer::forward(
 		imgState.ranges,    // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 		binningState.point_list,    // 按 tile ID、高斯深度 排序后的 values列表，即 高斯ID 列表
 		width, height,
+        focal_x, focal_y,
+        float(width*0.5f), float(height*0.5f),
+        viewmatrix,     // 观测变换矩阵，W2C
+        cam_pos,        // 当前相机中心的世界坐标
 		geomState.means2D,  // 已计算的 所有高斯 中心在当前相机图像平面的二维坐标 数组
 		feature_ptr,        // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组（每个高斯在当前观测方向下只有一个颜色，仅颜色强度分布不同）
+        all_map,        // 输入的 5通道tensor，[0-2]: 当前相机坐标系下所有高斯的法向量，即最短轴向量；[3]: 全1.0；[4]: 相机光心 到 所有高斯法向量垂直平面的 距离
 		geomState.conic_opacity,    // 已计算的 所有高斯 2D协方差矩阵的逆 和 不透明度 数组
 		imgState.accum_alpha,   // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
 		imgState.n_contrib,     // 输出的 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 		background,     // 背景颜色，默认为[0,0,0]，黑色
 		out_color               // 输出的 RGB图像（加上了背景颜色）
+        out_observe,            // 输出的 所有高斯 渲染时在透射率>0.5之前 对某像素有贡献的 像素个数
+        out_all_map,            // 输出的 5通道tensor，[0-2]：渲染的法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离
+        out_plane_depth,        // 输出的 无偏深度图（相机坐标系）
+        render_geo      // 是否要渲染 深度图和法向量图的标志，默认为False
         ), debug)
 
 	return num_rendered;
@@ -454,10 +468,12 @@ void CudaRasterizer::Rasterizer::backward(
     int M,  // 每个高斯的球谐系数个数=16
     int R,  // 所有高斯覆盖的 tile的总个数
 	const float* background,    // 背景颜色，默认为[0,0,0]，黑色
+    const float* all_map_pixels,    // forward输出的 5通道tensor，[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离
 	const int width, int height,
 	const float* means3D,   // 所有高斯 中心的世界坐标
 	const float* shs,       // 所有高斯的 球谐系数，(N,16,3)
 	const float* colors_precomp,    // python代码中 预计算的颜色，默认是空tensor
+    const float* all_maps,  // 输入的 5通道tensor，[0-2]: 当前相机坐标系下所有高斯的法向量，即最短轴向量；[3]: 全1.0；[4]: 相机光心 到 所有高斯法向量垂直平面的 距离
 	const float* scales,    // 所有高斯的 缩放因子
 	const float scale_modifier, // 缩放因子调节系数
 	const float* rotations, // 所有高斯的 旋转四元数
@@ -471,7 +487,10 @@ void CudaRasterizer::Rasterizer::backward(
 	char* binning_buffer,   // 存储所有高斯 排序数据的 tensor：包括未排序和排序后的 所有高斯覆盖的tile的 keys、values列表
 	char* img_buffer,       // 存储所有高斯 渲染后数据的 tensor：包括累积的透射率、最后一个贡献的高斯ID
 	const float* dL_dpix,   // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+    const float* dL_dout_all_map,       // 输入的 loss对forward输出的 5通道tensor 的梯度
+    const float* dL_dout_plane_depth,   // 输入的 loss对渲染的无偏深度图 的梯度
 	float* dL_dmean2D,  // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度
+    float* dL_dmean2D_abs,  // 输出的
 	float* dL_dconic,   // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
 	float* dL_dopacity, // 输出的 loss对所有高斯 不透明度 的梯度
 	float* dL_dcolor,   // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 的梯度
@@ -480,6 +499,8 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dsh,      // 输出的 loss对所有高斯 球谐系数 的梯度
 	float* dL_dscale,   // 输出的 loss对所有高斯 缩放因子 的梯度
 	float* dL_drot,     // 输出的 loss对所有高斯 旋转四元数 的梯度
+    float* dL_dall_map, // 输出的
+    const bool render_geo,  // 是否要渲染 深度图和法向量图的标志，默认为False
 	bool debug) // 默认为False
 {
     // 这些缓冲区都是在前向传播的时候存下来的，现在拿出来用
@@ -509,17 +530,25 @@ void CudaRasterizer::Rasterizer::backward(
 		imgState.ranges,    // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数
 		binningState.point_list,    // 按深度排序后的 所有高斯覆盖的tile的 values列表，每个元素是 对应高斯的ID
 		width, height,
+        focal_x, focal_y,
 		background,     // 背景颜色，默认为[0,0,0]，黑色
 		geomState.means2D,      // 所有高斯 中心投影在当前相机图像平面的二维坐标 数组
 		geomState.conic_opacity,    // 所有高斯 2D协方差的逆 和 不透明度 数组
 		color_ptr,      // 默认是 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
+        all_maps,           // 输入的 5通道tensor，[0-2]: 当前相机坐标系下所有高斯的法向量，即最短轴向量；[3]: 全1.0；[4]: 相机光心 到 所有高斯法向量垂直平面的 距离
+        all_map_pixels,     // forward输出的 5通道tensor，[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离
 		imgState.accum_alpha,   // 渲染后每个像素 pixel的 累积的透射率 的数组
 		imgState.n_contrib,     // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 		dL_dpix,    // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+        dL_dout_all_map,        // 输入的 loss对forward输出的 5通道tensor 的梯度
+        dL_dout_plane_depth,    // 输入的 loss对渲染的无偏深度图 的梯度
 		(float3*)dL_dmean2D,    // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度
+        (float3*)dL_dmean2D_abs,    // 输出的
 		(float4*)dL_dconic,     // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
 		dL_dopacity,            // 输出的 loss对所有高斯 不透明度 的梯度
-		dL_dcolor),     // 输出的 loss对所有高斯 RGB颜色 的梯度
+		dL_dcolor,              // 输出的 loss对所有高斯 RGB颜色 的梯度
+        dL_dall_map,            // 输出的
+        render_geo),    // 是否要渲染 深度图和法向量图的标志，默认为False
         debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
