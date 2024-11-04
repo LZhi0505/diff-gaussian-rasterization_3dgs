@@ -276,7 +276,7 @@ int CudaRasterizer::Rasterizer::forward(
 	const int P,    // 所有高斯的个数
     int D,      // 当前的球谐阶数
     int M,      // 每个高斯的球谐系数个数=16
-	const float* background,    // 背景颜色，默认为[1,1,1]，黑色
+	const float* background,    // 背景颜色，默认为[0,0,0]，黑色
 	const int width, int height,    // 图像宽、高
 	const float* means3D,   // 所有高斯 中心的世界坐标
 	const float* shs,       // 所有高斯的 球谐系数
@@ -437,7 +437,7 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.conic_opacity,    // 已计算的 所有高斯 2D协方差矩阵的逆 和 不透明度 数组
 		imgState.accum_alpha,   // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
 		imgState.n_contrib,     // 输出的 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
-		background,     // 背景颜色，默认为[1,1,1]，黑色
+		background,     // 背景颜色，默认为[0,0,0]，黑色
 		out_color               // 输出的 RGB图像（加上了背景颜色）
         ), debug)
 
@@ -453,7 +453,7 @@ void CudaRasterizer::Rasterizer::backward(
     int D,  // 当前的球谐阶数
     int M,  // 每个高斯的球谐系数个数=16
     int R,  // 所有高斯覆盖的 tile的总个数
-	const float* background,    // 背景颜色，默认为[1,1,1]，黑色
+	const float* background,    // 背景颜色，默认为[0,0,0]，黑色
 	const int width, int height,
 	const float* means3D,   // 所有高斯 中心的世界坐标
 	const float* shs,       // 所有高斯的 球谐系数，(N,16,3)
@@ -509,7 +509,7 @@ void CudaRasterizer::Rasterizer::backward(
 		imgState.ranges,    // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数
 		binningState.point_list,    // 按深度排序后的 所有高斯覆盖的tile的 values列表，每个元素是 对应高斯的ID
 		width, height,
-		background,     // 背景颜色，默认为[1,1,1]，黑色
+		background,     // 背景颜色，默认为[0,0,0]，黑色
 		geomState.means2D,      // 所有高斯 中心投影在当前相机图像平面的二维坐标 数组
 		geomState.conic_opacity,    // 所有高斯 2D协方差的逆 和 不透明度 数组
 		color_ptr,      // 默认是 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组

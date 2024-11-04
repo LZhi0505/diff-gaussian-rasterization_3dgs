@@ -49,7 +49,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) { //输入的�
  */
 std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
-	const torch::Tensor& background,    // 背景颜色，默认为[1,1,1]，黑色
+	const torch::Tensor& background,    // 背景颜色，默认为[0,0,0]，黑色
 	const torch::Tensor& means3D,   // 所有高斯 中心的世界坐标
     const torch::Tensor& colors,    // 预计算的颜色，默认是空tensor，后续在光栅化预处理阶段计算
     const torch::Tensor& opacity,   // 所有高斯的 不透明度
@@ -152,7 +152,7 @@ RasterizeGaussiansCUDA(
  */
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
- 	const torch::Tensor& background,    // 背景颜色，默认为[1,1,1]，黑色
+ 	const torch::Tensor& background,    // 背景颜色，默认为[0,0,0]，黑色
 	const torch::Tensor& means3D,   // 所有高斯 中心的世界坐标
 	const torch::Tensor& radii,     // 所有高斯 投影在当前相机图像平面上的最大半径
     const torch::Tensor& colors,    // python代码中 预计算的颜色，默认是空tensor
@@ -216,16 +216,16 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
-	  dL_dout_color.contiguous().data<float>(),     // 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
-	  dL_dmeans2D.contiguous().data<float>(),   // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
-	  dL_dconic.contiguous().data<float>(),         // 输出的 loss对所有高斯 2D协方差矩阵的 导数
-	  dL_dopacity.contiguous().data<float>(),   // 输出的 loss对所有高斯 不透明度的 导数
-	  dL_dcolors.contiguous().data<float>(),        // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
-	  dL_dmeans3D.contiguous().data<float>(),   // 输出的 loss对所有高斯 中心世界坐标的 导数
-	  dL_dcov3D.contiguous().data<float>(),     // 输出的 loss对所有高斯 3D协方差矩阵的 导数
-	  dL_dsh.contiguous().data<float>(),        // 输出的 loss对所有高斯 球谐系数的 导数
-	  dL_dscales.contiguous().data<float>(),    // 输出的 loss对所有高斯 缩放因子的 导数
-	  dL_drotations.contiguous().data<float>(),     // 输出的 loss对所有高斯 旋转四元数的 导数
+	  dL_dout_color.contiguous().data<float>(),     // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+	  dL_dmeans2D.contiguous().data<float>(),   // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标 的梯度
+	  dL_dconic.contiguous().data<float>(),         // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
+	  dL_dopacity.contiguous().data<float>(),   // 输出的 loss对所有高斯 不透明度 的梯度
+	  dL_dcolors.contiguous().data<float>(),        // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 的梯度
+	  dL_dmeans3D.contiguous().data<float>(),   // 输出的 loss对所有高斯 中心世界坐标 的梯度
+	  dL_dcov3D.contiguous().data<float>(),     // 输出的 loss对所有高斯 3D协方差矩阵 的梯度
+	  dL_dsh.contiguous().data<float>(),        // 输出的 loss对所有高斯 球谐系数 的梯度
+	  dL_dscales.contiguous().data<float>(),    // 输出的 loss对所有高斯 缩放因子 的梯度
+	  dL_drotations.contiguous().data<float>(),     // 输出的 loss对所有高斯 旋转四元数 的梯度
 	  debug);
   }
 

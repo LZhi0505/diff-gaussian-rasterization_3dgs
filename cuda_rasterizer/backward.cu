@@ -149,9 +149,10 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 	dL_dmeans[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
 }
 
-// Backward version of INVERSE 2D covariance matrix computation
-// (due to length launched as separate kernel before other 
-// backward steps contained in preprocess)
+
+/**
+ * 计算2D协方差矩阵的反向传播版本（由于计算量较大，在其他反传步骤之前作为单独的kernel进行计算，该函数包含在预处理过程中）
+ */
 __global__ void computeCov2DCUDA(
     int P,      // 所有高斯的个数
 	const float3* means,    // 所有高斯 中心的世界坐标
@@ -422,7 +423,7 @@ renderCUDA(
 	const uint2* __restrict__ ranges,   // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 	const uint32_t* __restrict__ point_list,    // 排序后的 values列表，每个元素是按（大顺序：各tile_ID，小顺序：落在该tile内各高斯的深度）排序后的 高斯ID
 	int W, int H,
-	const float* __restrict__ bg_color,     // 背景颜色，默认为[1,1,1]，黑色
+	const float* __restrict__ bg_color,     // 背景颜色，默认为[0,0,0]，黑色
 	const float2* __restrict__ points_xy_image,     // 所有高斯 中心在当前相机图像平面的二维坐标 数组
 	const float4* __restrict__ conic_opacity,       // 所有高斯 2D协方差的逆 和 不透明度 数组
 	const float* __restrict__ colors,       // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
@@ -672,7 +673,7 @@ void BACKWARD::render(
 	const uint2* ranges,    // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数
 	const uint32_t* point_list, // 按深度排序后的 所有高斯覆盖的tile的 values列表，每个元素是 对应高斯的ID
 	int W, int H,
-	const float* bg_color,  // 背景颜色，默认为[1,1,1]，黑色
+	const float* bg_color,  // 背景颜色，默认为[0,0,0]，黑色
 	const float2* means2D,  // 所有高斯 中心投影在当前相机图像平面的二维坐标 数组
 	const float4* conic_opacity,    // 所有高斯 2D协方差的逆 和 不透明度 数组
 	const float* colors,    // 默认是 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组

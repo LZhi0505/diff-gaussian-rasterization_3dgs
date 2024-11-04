@@ -332,7 +332,7 @@ renderCUDA(
 	const float4* __restrict__ conic_opacity,   // 所有高斯 2D协方差矩阵的逆 和 不透明度 的数组
 	float* __restrict__ final_T,                // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
 	uint32_t* __restrict__ n_contrib,           // 输出的 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
-	const float* __restrict__ bg_color,         // 提供的背景颜色，默认为[1,1,1]，黑色
+	const float* __restrict__ bg_color,         // 提供的背景颜色，默认为[0,0,0]，黑色
 	float* __restrict__ out_color)              // 输出的 RGB图像（加上了背景颜色）
 {
     // 1. 确定当前block处理的 tile的像素范围
@@ -468,7 +468,7 @@ void FORWARD::render(
 	const float4* conic_opacity,    // 已计算的 所有高斯 2D协方差矩阵的逆 和 不透明度
 	float* final_T,         // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
 	uint32_t* n_contrib,    // 输出的 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
-	const float* bg_color,  // 背景颜色，默认为[1,1,1]，黑色
+	const float* bg_color,  // 背景颜色，默认为[0,0,0]，黑色
 	float* out_color)       // 输出的 RGB图像（加上了背景颜色）
 {
     // 开始进入CUDA并行计算，将图像分为多个线程块（分配一个 进程）；每个线程块为每个像素分配一个线程；
