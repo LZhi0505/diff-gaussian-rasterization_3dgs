@@ -487,7 +487,7 @@ void CudaRasterizer::Rasterizer::backward(
 	char* binning_buffer,   // 存储所有高斯 排序数据的 tensor：包括未排序和排序后的 所有高斯覆盖的tile的 keys、values列表
 	char* img_buffer,       // 存储所有高斯 渲染后数据的 tensor：包括累积的透射率、最后一个贡献的高斯ID
 	const float* dL_dpix,   // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
-    const float* dL_dout_all_map,       // 输入的 loss对forward输出的 5通道tensor 的梯度
+    const float* dL_dout_all_map,       // 输入的 loss对forward输出的 5通道tensor（[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离）的梯度
     const float* dL_dout_plane_depth,   // 输入的 loss对渲染的无偏深度图 的梯度
 	float* dL_dmean2D,  // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度
     float* dL_dmean2D_abs,  // 输出的
@@ -540,7 +540,7 @@ void CudaRasterizer::Rasterizer::backward(
 		imgState.accum_alpha,   // 渲染后每个像素 pixel的 累积的透射率 的数组
 		imgState.n_contrib,     // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 		dL_dpix,    // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
-        dL_dout_all_map,        // 输入的 loss对forward输出的 5通道tensor 的梯度
+        dL_dout_all_map,        // 输入的 loss对forward输出的 5通道tensor（[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离）的梯度
         dL_dout_plane_depth,    // 输入的 loss对渲染的无偏深度图 的梯度
 		(float3*)dL_dmean2D,    // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度
         (float3*)dL_dmean2D_abs,    // 输出的

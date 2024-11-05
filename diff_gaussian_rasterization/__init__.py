@@ -166,8 +166,8 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raster_settings.projmatrix,     # 观测变换*投影变换矩阵，W2NDC = W2C * C2NDC
                 raster_settings.tanfovx, 
                 raster_settings.tanfovy, 
-                grad_out_color,     # 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
-                grad_out_all_map,   # 输入的 loss对forward输出的 5通道tensor 的梯度
+                grad_out_color,         # 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+                grad_out_all_map,       # 输入的 loss对forward输出的 5通道tensor（[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离）的梯度
                 grad_out_plane_depth,   # 输入的 loss对 渲染的无偏深度图 的梯度
                 sh,         # 所有高斯的 球谐系数，(N,16,3)
                 raster_settings.sh_degree,  # 当前的球谐阶数

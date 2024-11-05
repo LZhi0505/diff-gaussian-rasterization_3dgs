@@ -749,7 +749,7 @@ void BACKWARD::render(
 	const float* final_Ts,  // 渲染后每个像素 pixel的 累积的透射率 的数组
 	const uint32_t* n_contrib,  // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 	const float* dL_dpixels,    // 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
-    const float* dL_dout_all_map,       // 输入的 loss对forward输出的 5通道tensor 的梯度
+    const float* dL_dout_all_map,       // 输入的 loss对forward输出的 5通道tensor（[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离）的梯度
     const float* dL_dout_plane_depth,   // 输入的 loss对渲染的无偏深度图 的梯度
 	float3* dL_dmean2D,     // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
     float3* dL_dmean2D_abs, // 输出的

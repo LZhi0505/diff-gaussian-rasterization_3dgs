@@ -87,9 +87,9 @@ RasterizeGaussiansCUDA(
   // 3. 初始化 输出Tensor为 全0 Tensor
   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);         // 输出的 渲染的RGB图像 out_color (3,H,W)
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));    // 输出的 每个高斯在当前图像平面上的投影半径 radii (N,)
-  torch::Tensor out_observe = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));  // 输出的
-  torch::Tensor out_all_map = torch::full({NUM_ALL_MAP, H, W}, 0, float_opts);      // 输出的
-  torch::Tensor out_plane_depth = torch::full({1, H, W}, 0, float_opts);            // 输出的
+  torch::Tensor out_observe = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));  // 输出的 所有高斯 渲染时在透射率>0.5之前 对某像素有贡献的 像素个数 数组，(N,)
+  torch::Tensor out_all_map = torch::full({NUM_ALL_MAP, H, W}, 0, float_opts);      // 输出的 5通道tensor，[0-2]：渲染的法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离
+  torch::Tensor out_plane_depth = torch::full({1, H, W}, 0, float_opts);            // 输出的 无偏深度图（相机坐标系）
 
   // 4. 创建用于管理内存分配的辅助函数
   torch::Device device(torch::kCUDA);
@@ -175,11 +175,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const torch::Tensor& projmatrix,    // 观测变换*投影变换矩阵，W2NDC = W2C * C2NDC
 	const float tan_fovx,
 	const float tan_fovy,
-    const torch::Tensor& dL_dout_color,     // 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
-    const torch::Tensor& dL_dout_all_map,   // 输入的 loss对forward输出的 5通道tensor 的梯度
+    const torch::Tensor& dL_dout_color,         // 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+    const torch::Tensor& dL_dout_all_map,       // 输入的 loss对forward输出的 5通道tensor（[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离）的梯度
     const torch::Tensor& dL_dout_plane_depth,   // 输入的 loss对渲染的无偏深度图 的梯度
 	const torch::Tensor& sh,    // 所有高斯的 球谐系数，(N,16,3)
-	const int degree,   // # 当前的球谐阶数
+	const int degree,   // 当前的球谐阶数
 	const torch::Tensor& campos,    // 当前相机中心的世界坐标
 	const torch::Tensor& geomBuffer,    // 存储所有高斯 几何数据的 tensor：包括2D中心像素坐标、相机坐标系下的深度、3D协方差矩阵等
 	const int R,        // 所有高斯覆盖的 tile的总个数
@@ -234,9 +234,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
-	  dL_dout_color.contiguous().data<float>(),     // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
-      dL_dout_all_map.contiguous().data<float>(),
-      dL_dout_plane_depth.contiguous().data<float>(),
+	  dL_dout_color.contiguous().data<float>(),         // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+      dL_dout_all_map.contiguous().data<float>(),   // 输入的 loss对forward输出的 5通道tensor（[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离）的梯度
+      dL_dout_plane_depth.contiguous().data<float>(),   // 输入的 loss对渲染的无偏深度图 的梯度
 	  dL_dmeans2D.contiguous().data<float>(),   // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标 的梯度
       dL_dmeans2D_abs.contiguous().data<float>(),   // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度 的绝对值
 	  dL_dconic.contiguous().data<float>(),         // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
@@ -248,7 +248,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dscales.contiguous().data<float>(),    // 输出的 loss对所有高斯 缩放因子 的梯度
 	  dL_drotations.contiguous().data<float>(),     // 输出的 loss对所有高斯 旋转四元数 的梯度
       dL_dall_map.contiguous().data<float>(),   // 输出的
-      render_geo,
+      render_geo,   // 是否要渲染 深度图和法向量图的标志，默认为False
 	  debug);
   }
 
