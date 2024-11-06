@@ -490,7 +490,7 @@ void CudaRasterizer::Rasterizer::backward(
     const float* dL_dout_all_map,       // 输入的 loss对forward输出的 5通道tensor（[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离）的梯度
     const float* dL_dout_plane_depth,   // 输入的 loss对渲染的无偏深度图 的梯度
 	float* dL_dmean2D,  // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度
-    float* dL_dmean2D_abs,  // 输出的
+    float* dL_dmean2D_abs,  // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度 的绝对值
 	float* dL_dconic,   // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
 	float* dL_dopacity, // 输出的 loss对所有高斯 不透明度 的梯度
 	float* dL_dcolor,   // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 的梯度
@@ -499,7 +499,7 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dsh,      // 输出的 loss对所有高斯 球谐系数 的梯度
 	float* dL_dscale,   // 输出的 loss对所有高斯 缩放因子 的梯度
 	float* dL_drot,     // 输出的 loss对所有高斯 旋转四元数 的梯度
-    float* dL_dall_map, // 输出的
+    float* dL_dall_map, // 输出的 loss对所有高斯 5通道tensor（法向量、贡献度、光心到高斯法切平面距离）的梯度
     const bool render_geo,  // 是否要渲染 深度图和法向量图的标志，默认为False
 	bool debug) // 默认为False
 {
@@ -543,18 +543,15 @@ void CudaRasterizer::Rasterizer::backward(
         dL_dout_all_map,        // 输入的 loss对forward输出的 5通道tensor（[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离）的梯度
         dL_dout_plane_depth,    // 输入的 loss对渲染的无偏深度图 的梯度
 		(float3*)dL_dmean2D,    // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度
-        (float3*)dL_dmean2D_abs,    // 输出的
+        (float3*)dL_dmean2D_abs,    // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度 的绝对值
 		(float4*)dL_dconic,     // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
 		dL_dopacity,            // 输出的 loss对所有高斯 不透明度 的梯度
 		dL_dcolor,              // 输出的 loss对所有高斯 RGB颜色 的梯度
-        dL_dall_map,            // 输出的
+        dL_dall_map,            // 输出的 loss对所有高斯 5通道tensor（法向量、贡献度、光心到高斯法切平面距离）的梯度
         render_geo),    // 是否要渲染 深度图和法向量图的标志，默认为False
         debug)
 
-	// Take care of the rest of preprocessing. Was the precomputed covariance
-	// given to us or a scales/rot pair? If precomputed, pass that. If not,
-	// use the one we computed ourselves.
-    // 处理预处理的剩余部分
+
     // 如果传入的预计算3D协方差矩阵 不是空指针，则是预计算的3D协方差矩阵
     //                         是空指针（默认），则是 preprocess中计算的 所有高斯 在世界坐标系下的3D协方差矩阵
 	const float* cov3D_ptr = (cov3D_precomp != nullptr) ? cov3D_precomp : geomState.cov3D;

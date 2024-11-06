@@ -181,7 +181,17 @@ class _RasterizeGaussians(torch.autograd.Function):
 
         # 2. 反向传播：计算相关tensor的梯度
         # 调用 _C.rasterize_gaussians_backward()  --  rasterize_points.cu/ RasterizeGaussiansBackwardCUDA 进行反向传播。并传入重构到一个元组中的参数
-        # 返回：loss对所有高斯的（中心2D投影像素坐标、观测的RGB颜色、不透明度、中心3D世界坐标、3D协方差矩阵、缩放因子、球谐系数、旋转四元数）的梯度
+        # 返回：
+        #   loss对所有高斯 中心2D投影像素坐标 的梯度
+        #   loss对所有高斯 中心2D投影像素坐标 的梯度 的绝对值
+        #   loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 的梯度
+        #   loss对所有高斯 不透明度 的梯度
+        #   loss对所有高斯 中心3D世界坐标 的梯度
+        #   loss对所有高斯 3D协方差矩阵 的梯度
+        #   loss对所有高斯 球谐系数 的梯度
+        #   loss对所有高斯 缩放因子 的梯度
+        #   loss对所有高斯 旋转四元数 的梯度
+        #   loss对所有高斯 5通道tensor（法向量、贡献度、光心到高斯法切平面距离）的梯度
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # 先深拷贝一份输入参数，在出现异常时将其保存到文件中，以供调试
             try:
@@ -205,7 +215,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_scales,            # loss对所有高斯 缩放因子 的梯度
             grad_rotations,         # loss对所有高斯 旋转四元数 的梯度
             grad_cov3Ds_precomp,    # loss对所有高斯 3D协方差矩阵 的梯度
-            gard_all_map,           # loss对
+            gard_all_map,           # loss对所有高斯 5通道tensor（法向量、贡献度、光心到高斯法切平面距离）的梯度
             None,
         )
 

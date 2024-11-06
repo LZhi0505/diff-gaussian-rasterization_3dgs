@@ -237,7 +237,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dout_color.contiguous().data<float>(),         // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
       dL_dout_all_map.contiguous().data<float>(),   // 输入的 loss对forward输出的 5通道tensor（[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离）的梯度
       dL_dout_plane_depth.contiguous().data<float>(),   // 输入的 loss对渲染的无偏深度图 的梯度
-	  dL_dmeans2D.contiguous().data<float>(),   // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标 的梯度
+	  dL_dmeans2D.contiguous().data<float>(),   // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度
       dL_dmeans2D_abs.contiguous().data<float>(),   // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度 的绝对值
 	  dL_dconic.contiguous().data<float>(),         // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
 	  dL_dopacity.contiguous().data<float>(),   // 输出的 loss对所有高斯 不透明度 的梯度
@@ -247,12 +247,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dsh.contiguous().data<float>(),        // 输出的 loss对所有高斯 球谐系数 的梯度
 	  dL_dscales.contiguous().data<float>(),    // 输出的 loss对所有高斯 缩放因子 的梯度
 	  dL_drotations.contiguous().data<float>(),     // 输出的 loss对所有高斯 旋转四元数 的梯度
-      dL_dall_map.contiguous().data<float>(),   // 输出的
+      dL_dall_map.contiguous().data<float>(),   // 输出的 loss对所有高斯 5通道tensor（法向量、贡献度、光心到高斯法切平面距离）的梯度
       render_geo,   // 是否要渲染 深度图和法向量图的标志，默认为False
 	  debug);
   }
 
-  return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dcov3D, dL_dsh, dL_dscales, dL_drotations);
+  return std::make_tuple(dL_dmeans2D, dL_dmeans2D_abs, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dcov3D, dL_dsh, dL_dscales, dL_drotations, dL_dall_map);
 }
 
 
