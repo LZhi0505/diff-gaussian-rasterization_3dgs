@@ -106,7 +106,8 @@ RasterizeGaussiansCUDA(
   
   int rendered = 0; // 初始化渲染的tile个数为0
 
-  if(P != 0) {
+  if(P != 0)
+  {
       // 场景中存在高斯，则进行光栅化
 
       // 如果参数中输入了所有高斯的球谐系数，则 M=每个高斯的球谐系数个数=16；否则 M=0
@@ -159,7 +160,7 @@ RasterizeGaussiansCUDA(
  * 反向传播，求出
  * @return: 一个元组，包含：  dL_dmeans2D：
  */
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
  	const torch::Tensor& background,    // 背景颜色，默认为[0,0,0]，黑色
     const torch::Tensor& all_map_pixels,    // forward输出的 5通道tensor，[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离
@@ -211,7 +212,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dscales = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_drotations = torch::zeros({P, 4}, means3D.options());
   
-  if(P != 0) {
+  if(P != 0)
+  {
       //! 实际反向传播
 	  CudaRasterizer::Rasterizer::backward(P, degree, M, R,
 	  background.contiguous().data<float>(),

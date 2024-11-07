@@ -448,7 +448,7 @@ int CudaRasterizer::Rasterizer::forward(
 		imgState.accum_alpha,   // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
 		imgState.n_contrib,     // 输出的 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 		background,     // 背景颜色，默认为[0,0,0]，黑色
-		out_color               // 输出的 RGB图像（加上了背景颜色）
+		out_color,               // 输出的 RGB图像（加上了背景颜色）
         out_observe,            // 输出的 所有高斯 渲染时在透射率>0.5之前 对某像素有贡献的 像素个数
         out_all_map,            // 输出的 5通道tensor，[0-2]：渲染的法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离
         out_plane_depth,        // 输出的 无偏深度图（相机坐标系）

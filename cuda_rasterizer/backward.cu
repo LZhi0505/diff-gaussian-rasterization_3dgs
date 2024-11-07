@@ -424,6 +424,7 @@ renderCUDA(
 	const uint2* __restrict__ ranges,   // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 	const uint32_t* __restrict__ point_list,    // 排序后的 values列表，每个元素是按（大顺序：各tile_ID，小顺序：落在该tile内各高斯的深度）排序后的 高斯ID
 	int W, int H,
+    float fx, float fy,
 	const float* __restrict__ bg_color,     // 背景颜色，默认为[0,0,0]，黑色
 	const float2* __restrict__ points_xy_image,     // 所有高斯 中心在当前相机图像平面的二维坐标 数组
 	const float4* __restrict__ conic_opacity,       // 所有高斯 2D协方差的逆 和 不透明度 数组

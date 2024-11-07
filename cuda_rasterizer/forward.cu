@@ -361,7 +361,7 @@ renderCUDA(
     const float2 ray = { (pixf.x - cx) / focal_x, (pixf.y - cy) / focal_y };    // 当前处理的 像素 在Z=1平面的 坐标
 
     // 2. 判断当前线程处理的 像素 是否在图像有效像素范围内
-	bool inside = pix.x < W　&& pix.y < H;
+	bool inside = pix.x < W && pix.y < H;
     // 如果不在，则将 done设为 true，表示该线程不执行渲染操作
 	bool done = !inside;
 
@@ -441,7 +441,7 @@ renderCUDA(
 
             // 一个高斯对渲染某个像素的贡献度 = 光线经之前高斯后剩余的能量 * 该高斯对光线的吸收程度
             //                           = 光线经之前高斯累积的透射率 T * 当前高斯的alpha
-            const float aT = alpha * T
+            const float aT = alpha * T;
 
             // (3) α-blending计算当前像素的RGB三通道 颜色值 C（3DGS论文公式(3)）
 			for (int ch = 0; ch < CHANNELS; ch++)
