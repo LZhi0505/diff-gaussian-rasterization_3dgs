@@ -219,6 +219,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             None,
         )
 
+        # 当调用loss.backward()触发反向传播时，计算出的梯度会自动更新到每个可求导的输入张量的.grad属性中
+        # 例如有一个变量x，且x.requires_grad=True，那么在反向传播之后，x.grad将包含loss关于x的梯度
         return grads
 
 # 定义初始化类GaussianRasterizer的配置参数
