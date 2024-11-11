@@ -423,17 +423,21 @@ renderCUDA(
 	const uint2* __restrict__ ranges,   // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 	const uint32_t* __restrict__ point_list,    // 排序后的 values列表，每个元素是按（大顺序：各tile_ID，小顺序：落在该tile内各高斯的深度）排序后的 高斯ID
 	int W, int H,
+	int extra_C,
 	const float* __restrict__ bg_color,     // 背景颜色，默认为[0,0,0]，黑色
 	const float2* __restrict__ points_xy_image,     // 所有高斯 中心在当前相机图像平面的二维坐标 数组
 	const float4* __restrict__ conic_opacity,       // 所有高斯 2D协方差的逆 和 不透明度 数组
 	const float* __restrict__ colors,       // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
+	const float* __restrict__ extra_feats,
 	const float* __restrict__ final_Ts,     // 渲染后每个像素 pixel的 累积的透射率 的数组
 	const uint32_t* __restrict__ n_contrib,     // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 	const float* __restrict__ dL_dpixels,   // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+	const float* __restrict__ grad_out_extra_feats,
 	float3* __restrict__ dL_dmean2D,    // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度
 	float4* __restrict__ dL_dconic2D,   // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
 	float* __restrict__ dL_dopacity,    // 输出的 loss对所有高斯 不透明度 的梯度
-	float* __restrict__ dL_dcolors)     // 输出的 loss对所有高斯 颜色 的梯度
+	float* __restrict__ dL_dcolors,
+	float* __restrict__ dL_extra_feats)     // 输出的 loss对所有高斯 颜色 的梯度
 {
     // 重新进行光栅化计算，计算所需的块信息
     // 1. 确定当前block处理的 tile的像素范围
@@ -567,6 +571,12 @@ renderCUDA(
                 // (2) 更新 loss对当前高斯 颜色 的梯度
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);    // atomicAdd：CUDA编程中的一种原子 加 操作，确保在并发操作时多个线程访问同一内存地址的，执行安全、准确的 加法运算。因为这个像素可能只是受此高斯影响的众多像素之一
 			}
+
+			// FAN: theoriticall, grad of alpha should be influenced by both color and extra_features. Here we ignore this effect, keeping the original 3DGS optimization unchanged.
+			for (int ch = 0; ch < extra_C && inside; ch++) {
+				atomicAdd(&(dL_extra_feats[global_id * extra_C + ch]), dchannel_dcolor * grad_out_extra_feats[ch * H * W + pix_id]);
+			}
+
 			dL_dalpha *= T;
 
             // 更新 后一个高斯的 不透明度（用于下一次迭代）
@@ -673,33 +683,41 @@ void BACKWARD::render(
 	const uint2* ranges,    // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数
 	const uint32_t* point_list, // 按深度排序后的 所有高斯覆盖的tile的 values列表，每个元素是 对应高斯的ID
 	int W, int H,
+	int extra_C,
 	const float* bg_color,  // 背景颜色，默认为[0,0,0]，黑色
 	const float2* means2D,  // 所有高斯 中心投影在当前相机图像平面的二维坐标 数组
 	const float4* conic_opacity,    // 所有高斯 2D协方差的逆 和 不透明度 数组
 	const float* colors,    // 默认是 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
+	const float* extra_feats,
 	const float* final_Ts,  // 渲染后每个像素 pixel的 累积的透射率 的数组
 	const uint32_t* n_contrib,  // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 	const float* dL_dpixels,    // 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+	const float* grad_out_extra_feats,
 	float3* dL_dmean2D,     // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标的 导数
 	float4* dL_dconic2D,    // 输出的 loss对所有高斯 2D协方差矩阵的 导数
 	float* dL_dopacity,     // 输出的 loss对所有高斯 不透明度的 导数
-	float* dL_dcolors)      // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
+	float* dL_dcolors,
+	float* dL_extra_feats)      // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 导数
 {
     // 调用CUDA内核函数执行光栅化过程
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
 		point_list,
 		W, H,
+		extra_C,
 		bg_color,
 		means2D,
 		conic_opacity,
 		colors,
+		extra_feats,
 		final_Ts,
 		n_contrib,
 		dL_dpixels,
+		grad_out_extra_feats,
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
-		dL_dcolors
+		dL_dcolors,
+		dL_extra_feats
 		);
 }

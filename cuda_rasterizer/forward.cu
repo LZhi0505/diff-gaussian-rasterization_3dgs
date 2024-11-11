@@ -327,13 +327,21 @@ renderCUDA(
 	const uint2* __restrict__ ranges,   // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 	const uint32_t* __restrict__ point_list,    // 排序后的 values列表，每个元素是按（大顺序：各tile_ID，小顺序：落在该tile内各高斯的深度）排序后的 高斯ID
 	int W, int H,
+	int extra_C,        // 默认为 0
 	const float2* __restrict__ points_xy_image, // 所有高斯 中心在当前相机图像平面的二维坐标 的数组
 	const float* __restrict__ features,         // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
+	const float* __restrict__ extra_features,   // 默认为一个 NULL指针
+	const float* __restrict__ depths,           // 所有高斯 中心在当前相机坐标系下的z值（深度） 数组
 	const float4* __restrict__ conic_opacity,   // 所有高斯 2D协方差矩阵的逆 和 不透明度 的数组
 	float* __restrict__ final_T,                // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
 	uint32_t* __restrict__ n_contrib,           // 输出的 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 	const float* __restrict__ bg_color,         // 提供的背景颜色，默认为[0,0,0]，黑色
-	float* __restrict__ out_color)              // 输出的 RGB图像（加上了背景颜色）
+	float* __restrict__ out_color,          // 输出的 RGB图像（加上了背景颜色）
+	float* __restrict__ out_extra_feat,     // 输出的 根据额外信息进行a-blending计算的输出，默认为空
+	float* __restrict__ out_median_depth,   // 输出的 透射率接近0.5时的 深度图
+	float* __restrict__ transmittance,      // 输出的 所有高斯 对当前图像有贡献的像素 的贡献度之和
+	int* __restrict__ num_covered_pixels,   // 输出的 所有高斯 对当前图像有贡献的像素 的个数
+	bool record_transmittance)      // 是否返回 所有高斯贡献度 的标志。（只在要使用 贡献度剪枝 时才为True）
 {
     // 1. 确定当前block处理的 tile的像素范围
 	auto block = cg::this_thread_block();   // 获取当前线程所处的 block（对应一个 tile）
@@ -350,7 +358,7 @@ renderCUDA(
 	float2 pixf = { (float)pix.x, (float)pix.y };   // 当前处理的 像素 在像素平面的坐标(float)
 
     // 2. 判断当前线程处理的 像素 是否在图像有效像素范围内
-	bool inside = pix.x < W　&& pix.y < H;
+	bool inside = pix.x < W && pix.y < H;
     // 如果不在，则将 done设为 true，表示该线程不执行渲染操作
 	bool done = !inside;
 
@@ -372,6 +380,7 @@ renderCUDA(
 	uint32_t contributor = 0;       // 记录当前处理的像素穿过的高斯个数 = 对渲染当前像素RGB值 最后一个有贡献的高斯ID
 	uint32_t last_contributor = 0;  // 存储最终经过的高斯球数量
 	float C[CHANNELS] = { 0 };      // 最后渲染的颜色
+	float median_depth = {0};       // 透射率接近0.5时的深度值
 
     // 6. 遍历当前tile触及的高斯
     // 外循环：迭代分批渲染任务，每批最多处理 BLOCK_SIZE = 16*16个高斯
@@ -407,6 +416,11 @@ renderCUDA(
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };    // 当前处理的像素 到 当前2D高斯中心像素坐标的 位移向量
 			float4 con_o = collected_conic_opacity[j];          // 当前高斯的 2D协方差矩阵的逆 和 不透明度，x、y、z: 分别是2D协方差逆矩阵的上半对角元素, w：不透明度
 
+            float depth = depths[collected_id[j]];  // 当前高斯 中心在当前相机坐标系下的z值（深度） 数组
+			if (depth < NEAR_PLANE)
+                // 小于近平面，则说明不在视锥体内，跳过当前高斯
+                continue;
+
             // 另：一个高斯对渲染某个像素的贡献度 = 光线经之前高斯后剩余的能量 * 该高斯对光线的吸收程度
             //                             = 光线经之前高斯累积的透射率 T * 当前高斯的alpha（该高斯的不透明度 * 其2D高斯的投影分布）
 
@@ -418,6 +432,14 @@ renderCUDA(
 
             // 当前高斯的 alpha = 高斯的不透明度(包含2D高斯投影分布前面的常数部分) * 2D高斯的投影分布
 			float alpha = min(0.99f, con_o.w * exp(power));
+
+			if (record_transmittance) {
+                // 如果需返回 所有高斯贡献度（只在要使用 贡献度剪枝 时才为True），则计算 手动归一化的 当前高斯 对当前图像有贡献的像素 的平均贡献度
+				float trans = pow(alpha, 2 * GAMMA) * pow(T, 2 - 2 * GAMMA);    // 当前高斯 对 渲染当前像素的 贡献度，a^1 * T^1
+				atomicAdd(&transmittance[collected_id[j]], trans);  // 累加 当前高斯 对当前图像有贡献的像素 的贡献度之和
+				atomicAdd(&num_covered_pixels[collected_id[j]], 1); // 累加 当前高斯 对当前图像有贡献的像素 的个数
+			}
+
             if (alpha < 1.0f / 255.0f)
                 // 太小，则认为当前高斯对光线的吸收程度低，近似透明，所以跳过渲染它
 				continue;
@@ -430,10 +452,22 @@ renderCUDA(
 				continue;
 			}
 
+            // 记录 透射率接近0.5时的深度值 = 此时光线穿过的高斯中心 在当前相机坐标系下的z值
+			if (T > 0.5) {
+				median_depth = depth;
+			}
+
             // (3) α-blending计算当前像素的RGB三通道 颜色值 C（3DGS论文公式(3)）
 			for (int ch = 0; ch < CHANNELS; ch++)
                 // 每个通道的颜色 = 累加 当前高斯的颜色 * 当前高斯的贡献度
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+
+            if (inside && extra_C > 0) {
+                // 当有额外通道的信息，则通过a-blending计算。默认没有
+				// this might be slow due to lack of shared memory. Change of channel order may make it faster
+				for (int ch = 0; ch < extra_C; ch++)
+					out_extra_feat[ch * H * W + pix_id] += extra_features[collected_id[j] * extra_C + ch] * alpha * T;
+			}
 
 			T = test_T; // 更新经之前高斯累积的透射率
 
@@ -450,9 +484,12 @@ renderCUDA(
         final_T[pix_id] = T;    // 输出的 渲染像素pix_id的颜色过程中 累积的透射率
 		n_contrib[pix_id] = last_contributor;   // 输出的 渲染像素pix_id的颜色过程中 穿过的高斯的个数，也是最后一个对渲染当前像素RGB值 最后一个有贡献的高斯ID
 
-        // 最后输出的RGB颜色值 加上 背景颜色
+        // 最后输出的 RGB图 加上 背景颜色
         for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+
+        // 最后输出的 透射率接近0.5时的深度图
+		out_median_depth[pix_id] = median_depth;
 	}
 }
 
@@ -463,13 +500,21 @@ void FORWARD::render(
 	const uint2* ranges,        // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 	const uint32_t* point_list, // 按 tile ID、高斯深度 排序后的 values列表，即 高斯ID 列表
 	int W, int H,
+	int extra_C,    // 默认为 0
 	const float2* means2D,  // 已计算的 所有高斯 中心在当前相机图像平面的二维坐标
 	const float* colors,    // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
+	const float* feats,     // 默认为一个 NULL指针
+	const float* depths,    // 所有高斯 中心在当前相机坐标系下的z值（深度） 数组
 	const float4* conic_opacity,    // 已计算的 所有高斯 2D协方差矩阵的逆 和 不透明度
 	float* final_T,         // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
 	uint32_t* n_contrib,    // 输出的 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 	const float* bg_color,  // 背景颜色，默认为[0,0,0]，黑色
-	float* out_color)       // 输出的 RGB图像（加上了背景颜色）
+	float* out_color,           // 输出的 RGB图像（加上了背景颜色）
+	float* out_features,        // 输出的 根据额外信息进行a-blending计算的输出，默认为空
+	float* out_median_depth,    // 输出的 透射率接近0.5时的 深度图
+	float* transmittance,       // 输出的 所有高斯 对当前图像有贡献的像素 的贡献度之和
+	int* num_covered_pixels,    // 输出的 所有高斯 对当前图像有贡献的像素 的个数
+	bool record_transmittance)  // 是否返回 所有高斯贡献度 的标志。（只在要使用 贡献度剪枝 时才为True）
 {
     // 开始进入CUDA并行计算，将图像分为多个线程块（分配一个 进程）；每个线程块为每个像素分配一个线程；
     // 对于每个block只排序一次，认为block里面的pixel都被block中的所有gaussian影响且顺序一样。
@@ -479,13 +524,21 @@ void FORWARD::render(
 		ranges,
 		point_list,
 		W, H,
+		extra_C,
 		means2D,
 		colors,
+		feats,
+		depths,
 		conic_opacity,
 		final_T,
 		n_contrib,
 		bg_color,
-		out_color);
+		out_color,
+		out_features,
+		out_median_depth,
+		transmittance,
+		num_covered_pixels,
+		record_transmittance);
 }
 
 /**

@@ -53,13 +53,21 @@ namespace FORWARD
 		const uint2* ranges,
 		const uint32_t* point_list,
 		int W, int H,
+		int extra_C,
 		const float2* points_xy_image,
 		const float* features,
+		const float* extra_features,
+		const float* depths,
 		const float4* conic_opacity,
 		float* final_T,
 		uint32_t* n_contrib,
 		const float* bg_color,
-		float* out_color);
+		float* out_color,
+		float* out_features,
+		float* out_median_depth,
+		float* transmittance,
+		int* num_covered_pixels,
+		bool record_transmittance);
 }
 
 

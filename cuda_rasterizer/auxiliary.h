@@ -18,6 +18,12 @@
 #define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
 #define NUM_WARPS (BLOCK_SIZE/32)
 
+// distortion helper macros
+#define NEAR_PLANE 0.01
+#define FAR_PLANE 100.0
+
+#define GAMMA 0.5
+
 // Spherical harmonics coefficients
 __device__ const float SH_C0 = 0.28209479177387814f;
 __device__ const float SH_C1 = 0.4886025119029199f;
@@ -196,6 +202,18 @@ __forceinline__ __device__ bool in_frustum(int idx, // 该高斯的索引
 		return false;
 	}
 	return true;
+}
+
+__device__ __forceinline__ float atomicMax(float *address, float val)
+{
+    int ret = __float_as_int(*address);
+    while(val > __int_as_float(ret))
+    {
+        int old = ret;
+        if((ret = atomicCAS((int *)address, old, __float_as_int(val))) == old)
+            break;
+    }
+    return __int_as_float(ret);
 }
 
 #define CHECK_CUDA(A, debug) \

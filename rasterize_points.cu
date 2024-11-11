@@ -47,11 +47,12 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) { //输入的�
  *                          binningBuffer：存储所有高斯 排序数据的 tensor：包括未排序和排序后的 所有高斯覆盖的tile的 keys、values列表
  *                          imgBuffer：存储所有高斯 渲染后数据的 tensor：包括累积的透射率、最后一个贡献的高斯ID
  */
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,    // 背景颜色，默认为[0,0,0]，黑色
 	const torch::Tensor& means3D,   // 所有高斯 中心的世界坐标
     const torch::Tensor& colors,    // 预计算的颜色，默认是空tensor，后续在光栅化预处理阶段计算
+    const torch::Tensor& extra_feats,   // 默认为空tensor
     const torch::Tensor& opacity,   // 所有高斯的 不透明度
 	const torch::Tensor& scales,    // 所有高斯的 缩放因子
 	const torch::Tensor& rotations, // 所有高斯的 旋转四元数
@@ -67,6 +68,7 @@ RasterizeGaussiansCUDA(
 	const int degree,           // 当前的球谐阶数
 	const torch::Tensor& campos,    // 当前相机中心的世界坐标
 	const bool prefiltered,     // 预滤除的标志，默认为False
+	const bool record_transmittance,    // 是否返回 累积透射率T 的标志。（只在要使用 贡献度剪枝 时才为True）
 	const bool debug)           // 默认为False
 {
   // 1. 检查所有高斯中心世界坐标 tensor的维度必须是(N,3)
@@ -78,13 +80,26 @@ RasterizeGaussiansCUDA(
   const int H = image_height;       // 图像高度
   const int W = image_width;        // 图像宽度
 
+  int extra_C = 0;
+  if (extra_feats.ndimension() == 2){
+	extra_C = extra_feats.size(1);
+  }
+  else if (extra_feats.ndimension() != 1){
+    AT_ERROR("Dimension of extra_feats is neithor 3 nor 1.");
+  }
+
   // 2. 根据张量 means3D的数据类型，创建 int32 和 float32数据类型，分别用于整数和浮点数
   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
 
   // 3. 初始化输出Tensor：渲染的RGB图像 out_color (3,H,W) 和 每个高斯在当前图像平面上的投影半径 radii (N,) 为全 0 Tensor
   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
+  torch::Tensor out_features = torch::full({extra_C, H, W}, 0.0, float_opts);
+  torch::Tensor out_median_depth = torch::full({1, H, W}, 0.0, float_opts);
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
+
+  torch::Tensor transmittance = torch::full({P}, 0.0, float_opts);
+  torch::Tensor num_occluder = torch::full({P}, 0, int_opts);
 
   // 4. 创建用于管理内存分配的辅助函数
   torch::Device device(torch::kCUDA);
@@ -123,10 +138,12 @@ RasterizeGaussiansCUDA(
         M,          // 每个高斯的球谐系数个数=16
 		background.contiguous().data<float>(),
 		W, H,
+		extra_C,    // 默认为 0
 		means3D.contiguous().data<float>(),     // PyTorch Tensor 默认使用 row-major内存布局，而一些计算库如 CUDA更喜欢 column-major布局，通过 contiguous()可以确保数据在内存中是连续的
 		sh.contiguous().data_ptr<float>(),      // CudaRasterizer::Rasterizer::forward需要C风格的原始指针作为输入，而不是Pytorch Tensor对象
 		colors.contiguous().data<float>(),      // data<float>() 方法会返回 Tensor中数据的原始指针，同时将数据类型转换为 float*
-		opacity.contiguous().data<float>(), 
+		extra_feats.contiguous().data<float>(), // 默认为空tensor，则传入一个 NULL指针
+		opacity.contiguous().data<float>(),
 		scales.contiguous().data_ptr<float>(),
 		scale_modifier,
 		rotations.contiguous().data_ptr<float>(),
@@ -138,11 +155,16 @@ RasterizeGaussiansCUDA(
 		tan_fovy,
 		prefiltered,
 		out_color.contiguous().data<float>(),   // 输出的 RGB图像，考虑了背景颜色，(3,H,W)
+		out_features.contiguous().data<float>(),    // 输出的 根据额外信息进行a-blending计算的输出，默认为空
+		out_median_depth.contiguous().data<float>(),    // 输出的 透射率接近0.5时的 深度图
+		transmittance.contiguous().data<float>(),   // 输出的 所有高斯 对当前图像有贡献的像素 的贡献度之和
+		num_occluder.contiguous().data<int>(),  // 输出的 所有高斯 对当前图像有贡献的像素 的个数
+		record_transmittance,       // 是否返回 所有高斯贡献度 的标志。（只在要使用 贡献度剪枝 时才为True）
 		radii.contiguous().data<int>(),         // 输出的 所有高斯 投影在当前相机图像平面的最大半径 数组，(N,)
 		debug);
   }
 
-  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer);
+  return std::make_tuple(rendered, out_color, out_features, out_median_depth, radii, geomBuffer, binningBuffer, imgBuffer, transmittance, num_occluder);
 }
 
 
@@ -150,12 +172,13 @@ RasterizeGaussiansCUDA(
  * 反向传播，求出
  * @return: 一个元组，包含：  dL_dmeans2D：
  */
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
  	const torch::Tensor& background,    // 背景颜色，默认为[0,0,0]，黑色
 	const torch::Tensor& means3D,   // 所有高斯 中心的世界坐标
 	const torch::Tensor& radii,     // 所有高斯 投影在当前相机图像平面上的最大半径
     const torch::Tensor& colors,    // python代码中 预计算的颜色，默认是空tensor
+    const torch::Tensor& extra_feats,
 	const torch::Tensor& scales,    // 所有高斯的 缩放因子
 	const torch::Tensor& rotations, // 所有高斯的 旋转四元数
 	const float scale_modifier, // 缩放因子调节系数
@@ -165,6 +188,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const float tan_fovx,
 	const float tan_fovy,
     const torch::Tensor& dL_dout_color, // 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+	const torch::Tensor& grad_out_extra_feats,
 	const torch::Tensor& sh,    // 所有高斯的 球谐系数，(N,16,3)
 	const int degree,   // # 当前的球谐阶数
 	const torch::Tensor& campos,    // 当前相机中心的世界坐标
@@ -178,6 +202,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   const int H = dL_dout_color.size(1);  // 图像高
   const int W = dL_dout_color.size(2);  // 图像宽
 
+  int extra_C = 0;
+  if (extra_feats.ndimension() == 2){
+	extra_C = extra_feats.size(1);
+  }
+  else if (extra_feats.ndimension() != 1){
+    AT_ERROR("Dimension of extra_feats is neithor 3 nor 1.");
+  }
+
   // 如果参数中输入了所有高斯的球谐系数，则 M=每个高斯的球谐系数个数=16；否则 M=0
   int M = 0;
   if(sh.size(0) != 0)
@@ -188,6 +220,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dmeans3D = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dcolors = torch::zeros({P, NUM_CHANNELS}, means3D.options());
+  torch::Tensor dL_extra_feats = torch::zeros({P, extra_C}, means3D.options());
   torch::Tensor dL_dconic = torch::zeros({P, 2, 2}, means3D.options());
   torch::Tensor dL_dopacity = torch::zeros({P, 1}, means3D.options());
   torch::Tensor dL_dcov3D = torch::zeros({P, 6}, means3D.options());
@@ -199,10 +232,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
       //! 实际反向传播
 	  CudaRasterizer::Rasterizer::backward(P, degree, M, R,
 	  background.contiguous().data<float>(),
-	  W, H, 
+	  W, H,
+	  extra_C,
 	  means3D.contiguous().data<float>(),
 	  sh.contiguous().data<float>(),
 	  colors.contiguous().data<float>(),
+	  extra_feats.contiguous().data<float>(),
 	  scales.data_ptr<float>(),
 	  scale_modifier,
 	  rotations.data_ptr<float>(),
@@ -217,10 +252,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
 	  dL_dout_color.contiguous().data<float>(),     // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+	  grad_out_extra_feats.contiguous().data<float>(),
 	  dL_dmeans2D.contiguous().data<float>(),   // 输出的 loss对所有高斯 中心投影到图像平面的像素坐标 的梯度
 	  dL_dconic.contiguous().data<float>(),         // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
 	  dL_dopacity.contiguous().data<float>(),   // 输出的 loss对所有高斯 不透明度 的梯度
 	  dL_dcolors.contiguous().data<float>(),        // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 的梯度
+	  dL_extra_feats.contiguous().data<float>(),
 	  dL_dmeans3D.contiguous().data<float>(),   // 输出的 loss对所有高斯 中心世界坐标 的梯度
 	  dL_dcov3D.contiguous().data<float>(),     // 输出的 loss对所有高斯 3D协方差矩阵 的梯度
 	  dL_dsh.contiguous().data<float>(),        // 输出的 loss对所有高斯 球谐系数 的梯度
@@ -229,7 +266,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  debug);
   }
 
-  return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dcov3D, dL_dsh, dL_dscales, dL_drotations);
+  return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_extra_feats, dL_dopacity, dL_dmeans3D, dL_dcov3D, dL_dsh, dL_dscales, dL_drotations);
 }
 
 

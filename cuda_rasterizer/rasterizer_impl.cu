@@ -278,9 +278,11 @@ int CudaRasterizer::Rasterizer::forward(
     int M,      // 每个高斯的球谐系数个数=16
 	const float* background,    // 背景颜色，默认为[0,0,0]，黑色
 	const int width, int height,    // 图像宽、高
+	int extra_C,    // 默认为 0
 	const float* means3D,   // 所有高斯 中心的世界坐标
 	const float* shs,       // 所有高斯的 球谐系数
 	const float* colors_precomp,    // 因预计算的颜色默认是空tensor，则其传入的是一个 NULL指针
+	const float* extra_feats,   // 默认为空tensor，则传入一个 NULL指针
 	const float* opacities, // 所有高斯的 不透明度
 	const float* scales,    // 所有高斯的 缩放因子
 	const float scale_modifier, // 缩放因子的调整系数
@@ -292,6 +294,11 @@ int CudaRasterizer::Rasterizer::forward(
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,     // 预滤除的标志，默认为False
 	float* out_color,       // 输出的 RGB图像，考虑了背景颜色，(3,H,W)
+	float* out_features,    // 输出的 根据额外信息进行a-blending计算的输出，默认为空
+	float* out_median_depth,    // 输出的 透射率接近0.5时的 深度图
+	float* transmittance,       // 输出的 对当前图像有贡献的像素 的贡献度之和
+	int* num_covered_pixels,    // 输出的 对当前图像有贡献的像素 的个数
+	bool record_transmittance,  // 是否返回 所有高斯贡献度 的标志。（只在要使用 贡献度剪枝 时才为True）
 	int* radii,             // 输出的 所有高斯 投影在当前相机图像平面的最大半径 数组，(N,)
 	bool debug)     // 默认为False
 {
@@ -424,6 +431,7 @@ int CudaRasterizer::Rasterizer::forward(
     // 如果传入的预计算的颜色 不是空指针，则是预计算的颜色
     //                    是空指针（默认），则是 preprocess中计算的 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+    const float* extra_feature_ptr = extra_feats;   // 默认为一个 NULL指针
 
     //! 7. 渲染: 在一个block上协作渲染一个tile内各像素的RGB颜色值，每个线程负责一个像素。具体实现在 forward.cu/renderCUDA
 	CHECK_CUDA(FORWARD::render(
@@ -432,14 +440,22 @@ int CudaRasterizer::Rasterizer::forward(
 		imgState.ranges,    // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 		binningState.point_list,    // 按 tile ID、高斯深度 排序后的 values列表，即 高斯ID 列表
 		width, height,
+		extra_C,        // 默认为 0
 		geomState.means2D,  // 已计算的 所有高斯 中心在当前相机图像平面的二维坐标 数组
 		feature_ptr,        // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组（每个高斯在当前观测方向下只有一个颜色，仅颜色强度分布不同）
+		extra_feature_ptr,  // 默认为一个 NULL指针
+		geomState.depths,           // 所有高斯 中心在当前相机坐标系下的z值（深度） 数组
 		geomState.conic_opacity,    // 已计算的 所有高斯 2D协方差矩阵的逆 和 不透明度 数组
 		imgState.accum_alpha,   // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
 		imgState.n_contrib,     // 输出的 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 		background,     // 背景颜色，默认为[0,0,0]，黑色
-		out_color               // 输出的 RGB图像（加上了背景颜色）
-        ), debug)
+		out_color,               // 输出的 RGB图像（加上了背景颜色）
+        out_features,       // 输出的 根据额外信息进行a-blending计算的输出，默认为空
+		out_median_depth,   // 输出的 透射率接近0.5时的 深度图
+		transmittance,      // 输出的 所有高斯 对当前图像有贡献的像素 的贡献度之和
+		num_covered_pixels, // 输出的 所有高斯 对当前图像有贡献的像素 的个数
+		record_transmittance),  // 是否返回 所有高斯贡献度 的标志。（只在要使用 贡献度剪枝 时才为True）
+		debug)
 
 	return num_rendered;
 }
@@ -455,9 +471,11 @@ void CudaRasterizer::Rasterizer::backward(
     int R,  // 所有高斯覆盖的 tile的总个数
 	const float* background,    // 背景颜色，默认为[0,0,0]，黑色
 	const int width, int height,
+    int extra_C,
 	const float* means3D,   // 所有高斯 中心的世界坐标
 	const float* shs,       // 所有高斯的 球谐系数，(N,16,3)
 	const float* colors_precomp,    // python代码中 预计算的颜色，默认是空tensor
+	const float* extra_feats,
 	const float* scales,    // 所有高斯的 缩放因子
 	const float scale_modifier, // 缩放因子调节系数
 	const float* rotations, // 所有高斯的 旋转四元数
@@ -471,10 +489,12 @@ void CudaRasterizer::Rasterizer::backward(
 	char* binning_buffer,   // 存储所有高斯 排序数据的 tensor：包括未排序和排序后的 所有高斯覆盖的tile的 keys、values列表
 	char* img_buffer,       // 存储所有高斯 渲染后数据的 tensor：包括累积的透射率、最后一个贡献的高斯ID
 	const float* dL_dpix,   // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+	const float* grad_out_extra_feats,
 	float* dL_dmean2D,  // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度
 	float* dL_dconic,   // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
 	float* dL_dopacity, // 输出的 loss对所有高斯 不透明度 的梯度
 	float* dL_dcolor,   // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 的梯度
+	float* dL_extra_feats,
 	float* dL_dmean3D,  // 输出的 loss对所有高斯 中心世界坐标 的梯度
 	float* dL_dcov3D,   // 输出的 loss对所有高斯 3D协方差矩阵 的梯度
 	float* dL_dsh,      // 输出的 loss对所有高斯 球谐系数 的梯度
@@ -509,17 +529,21 @@ void CudaRasterizer::Rasterizer::backward(
 		imgState.ranges,    // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数
 		binningState.point_list,    // 按深度排序后的 所有高斯覆盖的tile的 values列表，每个元素是 对应高斯的ID
 		width, height,
+		extra_C,
 		background,     // 背景颜色，默认为[0,0,0]，黑色
 		geomState.means2D,      // 所有高斯 中心投影在当前相机图像平面的二维坐标 数组
 		geomState.conic_opacity,    // 所有高斯 2D协方差的逆 和 不透明度 数组
 		color_ptr,      // 默认是 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
+		extra_feats,
 		imgState.accum_alpha,   // 渲染后每个像素 pixel的 累积的透射率 的数组
 		imgState.n_contrib,     // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 		dL_dpix,    // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+		grad_out_extra_feats,
 		(float3*)dL_dmean2D,    // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度
 		(float4*)dL_dconic,     // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
 		dL_dopacity,            // 输出的 loss对所有高斯 不透明度 的梯度
-		dL_dcolor),     // 输出的 loss对所有高斯 RGB颜色 的梯度
+		dL_dcolor,
+		dL_extra_feats),     // 输出的 loss对所有高斯 RGB颜色 的梯度
         debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
