@@ -101,6 +101,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.campos,         # 当前相机中心的世界坐标
             raster_settings.prefiltered,    # 预滤除的标志，默认为False
             raster_settings.render_geo,     # 是否要渲染 深度图和法向量图的标志，默认为False
+            raster_settings.record_transmittance,   # 是否返回 所有高斯贡献度 的标志。（只在要使用 贡献度剪枝 时才为True）
             raster_settings.debug           # 默认为False
         )
 
@@ -114,17 +115,26 @@ class _RasterizeGaussians(torch.autograd.Function):
         #   输出的 5通道tensor，[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离
         #   渲染的 无偏深度图（相机坐标系）
         #   存储所有高斯的 几何、排序、渲染后数据的tensor
+        #   所有高斯 对当前图像有贡献的像素 的贡献度之和
+        #   所有高斯 对当前图像有贡献的像素 的个数
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # 先深拷贝一份输入参数，在出现异常时将其保存到文件中，以供调试
             try:
-                num_rendered, color, radii, out_observe, out_all_map, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
+                num_rendered, color, radii, out_observe, out_all_map, geomBuffer, binningBuffer, imgBuffer, transmittance, num_covered_pixels = _C.rasterize_gaussians(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_fw.dump")
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
             # 不是debug模式（默认）
-            num_rendered, color, radii, out_observe, out_all_map, out_plane_depth, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
+            num_rendered, color, radii, out_observe, out_all_map, out_plane_depth, geomBuffer, binningBuffer, imgBuffer, transmittance, num_covered_pixels = _C.rasterize_gaussians(*args)
+
+        # 如果设置了 返回累计透射率，则只返回：
+        #   所有高斯 对当前图像有贡献的像素 的贡献度之和
+        #   所有高斯 对当前图像有贡献的像素 的个数
+        #   所有高斯 投影在当前相机图像平面上的最大半径 数组
+        if raster_settings.record_transmittance:
+            return transmittance, num_covered_pixels, radii
 
         # 3. 记录前向传播输出的tensor到ctx中，用于反向传播
         ctx.raster_settings = raster_settings   # 光栅化输入参数
@@ -237,6 +247,7 @@ class GaussianRasterizationSettings(NamedTuple):
     campos : torch.Tensor   # 当前相机中心的世界坐标
     prefiltered : bool      # 预滤除的标志，默认为False
     render_geo : bool       # 是否要渲染 深度图和法向量图的标志，默认为False
+    record_transmittance: bool  # 是否返回 所有高斯贡献度 的标志。（只在要使用 贡献度剪枝 时才为True）
     debug : bool
 
 # 光栅器类，继承自nn.Module类，用于光栅化3D高斯

@@ -55,6 +55,9 @@ namespace CudaRasterizer
             float* out_all_map,
             float* out_plane_depth,
             const bool render_geo,
+            float* transmittance,
+            int* num_covered_pixels,
+            bool record_transmittance,
 			bool debug = false);
 
 		static void backward(

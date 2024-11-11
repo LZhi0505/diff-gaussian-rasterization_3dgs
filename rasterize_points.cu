@@ -47,7 +47,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) { //输入的�
  *                          binningBuffer：存储所有高斯 排序数据的 tensor：包括未排序和排序后的 所有高斯覆盖的tile的 keys、values列表
  *                          imgBuffer：存储所有高斯 渲染后数据的 tensor：包括累积的透射率、最后一个贡献的高斯ID
  */
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,    // 背景颜色，默认为[0,0,0]，黑色
 	const torch::Tensor& means3D,   // 所有高斯 中心的世界坐标
@@ -69,6 +69,7 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& campos,    // 当前相机中心的世界坐标
 	const bool prefiltered,     // 预滤除的标志，默认为False
     const bool render_geo,      // 是否要渲染 深度图和法向量图的标志，默认为False
+    const bool record_transmittance,    // 是否返回 所有高斯贡献度 的标志。（只在要使用 贡献度剪枝 时才为True）
 	const bool debug)           // 默认为False
 {
   // 1. 检查所有高斯中心世界坐标 tensor的维度必须是(N,3)
@@ -90,6 +91,9 @@ RasterizeGaussiansCUDA(
   torch::Tensor out_observe = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));  // 输出的 所有高斯 渲染时在透射率>0.5之前 对某像素有贡献的 像素个数 数组，(N,)
   torch::Tensor out_all_map = torch::full({NUM_ALL_MAP, H, W}, 0, float_opts);      // 输出的 5通道tensor，[0-2]：渲染的法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离
   torch::Tensor out_plane_depth = torch::full({1, H, W}, 0, float_opts);            // 输出的 无偏深度图（相机坐标系）
+
+  torch::Tensor transmittance = torch::full({P}, 0.0, float_opts);  // 输出的 所有高斯 对当前图像有贡献的像素 的贡献度之和
+  torch::Tensor num_occluder = torch::full({P}, 0, int_opts);       // 输出的 所有高斯 对当前图像有贡献的像素 的个数
 
   // 4. 创建用于管理内存分配的辅助函数
   torch::Device device(torch::kCUDA);
@@ -148,10 +152,13 @@ RasterizeGaussiansCUDA(
         out_all_map.contiguous().data<float>(),     // 输出的 5通道tensor，[0-2]：渲染的法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离
         out_plane_depth.contiguous().data<float>(), // 输出的 无偏深度图（相机坐标系）
         render_geo,     // 是否要渲染 深度图和法向量图的标志，默认为False
+        transmittance.contiguous().data<float>(),   // 输出的 所有高斯 对当前图像有贡献的像素 的贡献度之和
+        num_occluder.contiguous().data<int>(),          // 输出的 所有高斯 对当前图像有贡献的像素 的个数
+        record_transmittance,       // 是否返回 所有高斯贡献度 的标志。（只在要使用 贡献度剪枝 时才为True）
 		debug);
   }
 
-  return std::make_tuple(rendered, out_color, radii, out_observe, out_all_map, out_plane_depth, geomBuffer, binningBuffer, imgBuffer);
+  return std::make_tuple(rendered, out_color, radii, out_observe, out_all_map, out_plane_depth, geomBuffer, binningBuffer, imgBuffer, transmittance, num_occluder);
 }
 
 
@@ -159,7 +166,7 @@ RasterizeGaussiansCUDA(
  * 反向传播，求出
  * @return: 一个元组，包含：  dL_dmeans2D：
  */
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
  	const torch::Tensor& background,    // 背景颜色，默认为[0,0,0]，黑色
     const torch::Tensor& all_map_pixels,    // forward输出的 5通道tensor，[0-2]：渲染的 法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：渲染的 相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离

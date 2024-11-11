@@ -342,7 +342,10 @@ renderCUDA(
     int* __restrict__ out_observe,          // 输出的 所有高斯 渲染时在透射率>0.5之前 对某像素有贡献的 像素个数
     float* __restrict__ out_all_map,        // 输出的 5通道tensor，[0-2]：渲染的法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离
     float* __restrict__ out_plane_depth,    // 输出的 无偏深度图（相机坐标系）
-    const bool render_geo)      // 是否要渲染 深度图和法向量图的标志，默认为False
+    const bool render_geo,              // 是否要渲染 深度图和法向量图的标志，默认为False
+    float* __restrict__ transmittance,      // 输出的 所有高斯 对当前图像有贡献的像素 的贡献度之和
+    int* __restrict__ num_covered_pixels,   // 输出的 所有高斯 对当前图像有贡献的像素 的个数
+    bool record_transmittance)          // 是否返回 所有高斯贡献度 的标志。（只在要使用 贡献度剪枝 时才为True）
 {
     // 1. 确定当前block处理的 tile的像素范围
 	auto block = cg::this_thread_block();   // 获取当前线程所处的 block（对应一个 tile）
@@ -361,7 +364,7 @@ renderCUDA(
     const float2 ray = { (pixf.x - cx) / focal_x, (pixf.y - cy) / focal_y };    // 当前处理的 像素 在Z=1平面的 坐标
 
     // 2. 判断当前线程处理的 像素 是否在图像有效像素范围内
-	bool inside = pix.x < W　&& pix.y < H;
+	bool inside = pix.x < W && pix.y < H;
     // 如果不在，则将 done设为 true，表示该线程不执行渲染操作
 	bool done = !inside;
 
@@ -431,6 +434,13 @@ renderCUDA(
                 // 太小，则认为当前高斯对光线的吸收程度低，近似透明，所以跳过渲染它
 				continue;
 
+            if (record_transmittance) {
+                // 如果需返回 所有高斯贡献度（只在要使用 贡献度剪枝 时才为True），则计算 手动归一化的 当前高斯 对当前图像有贡献的像素 的平均贡献度
+                float trans = pow(alpha, 2 * GAMMA) * pow(T, 2 - 2 * GAMMA);    // 当前高斯 对 渲染当前像素的 贡献度，a^1 * T^1
+                atomicAdd(&transmittance[collected_id[j]], trans);  // 累加 当前高斯 对当前图像有贡献的像素 的贡献度之和
+                atomicAdd(&num_covered_pixels[collected_id[j]], 1); // 累加 当前高斯 对当前图像有贡献的像素 的个数
+            }
+
             // (2) 计算 经当前高斯后的透射率（剩余能量） = 经之前高斯光线剩余的能量（T） * 当前高斯吸收光线后剩余的能量（1-alpha）
             float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f) {
@@ -441,7 +451,7 @@ renderCUDA(
 
             // 一个高斯对渲染某个像素的贡献度 = 光线经之前高斯后剩余的能量 * 该高斯对光线的吸收程度
             //                           = 光线经之前高斯累积的透射率 T * 当前高斯的alpha
-            const float aT = alpha * T
+            const float aT = alpha * T;
 
             // (3) α-blending计算当前像素的RGB三通道 颜色值 C（3DGS论文公式(3)）
 			for (int ch = 0; ch < CHANNELS; ch++)
@@ -515,7 +525,10 @@ void FORWARD::render(
     int* out_observe,           // 输出的 所有高斯 渲染时在透射率>0.5之前 对某像素有贡献的 像素个数
     float* out_all_map,         // 输出的 5通道tensor，[0-2]：渲染的法向量（相机坐标系）；[3]：每个像素对应的 对其渲染有贡献的 所有高斯累加的贡献度；[4]：相机光心 到 每个像素穿过的所有高斯法向量垂直平面的 距离
     float* out_plane_depth,     // 输出的 无偏深度图
-    const bool render_geo)  // 是否要渲染 深度图和法向量图的标志，默认为False
+    const bool render_geo,          // 是否要渲染 深度图和法向量图的标志，默认为False
+    float* transmittance,       // 输出的 所有高斯 对当前图像有贡献的像素 的贡献度之和
+    int* num_covered_pixels,    // 输出的 所有高斯 对当前图像有贡献的像素 的个数
+    bool record_transmittance)      // 是否返回 所有高斯贡献度 的标志。（只在要使用 贡献度剪枝 时才为True）
 {
     // 开始进入CUDA并行计算，将图像分为多个线程块（分配一个 进程）；每个线程块为每个像素分配一个线程；
     // 对于每个block只排序一次，认为block里面的pixel都被block中的所有gaussian影响且顺序一样。
@@ -540,7 +553,10 @@ void FORWARD::render(
         out_observe,
         out_all_map,
         out_plane_depth,
-        render_geo);
+        render_geo,
+        transmittance,
+        num_covered_pixels,
+        record_transmittance);
 }
 
 /**

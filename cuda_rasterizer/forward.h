@@ -68,7 +68,10 @@ namespace FORWARD
         int* out_observe,
         float* out_all_map,
         float* out_plane_depth,
-        const bool render_geo);
+        const bool render_geo,
+        float* transmittance,
+        int* num_covered_pixels,
+        bool record_transmittance);
 }
 
 
