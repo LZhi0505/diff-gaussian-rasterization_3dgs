@@ -22,7 +22,7 @@ def cpu_deep_copy_tuple(input_tuple):
 # 调用自定义的_RasterizeGaussians的apply方法
 def rasterize_gaussians(
     means3D,
-    means2D,    # 输出的 所有高斯中心投影在图像平面的坐标
+    means2D,    # 为计算 所有高斯中心投影在图像平面的坐标梯度 的占位参数
     sh,
     colors_precomp,
     opacities,
@@ -49,11 +49,9 @@ class _RasterizeGaussians(torch.autograd.Function):
     forward：自定义操作执行计算，输入参数，返回输出
     backward：如何计算自定义操作相对于其输入的梯度，根据前向传播的结果和外部梯度计算输入张量的梯度
 
-    forward和 backward函数的输入输出需要相对应：
+    forward的输出 与 backward的输入 要对应，backward的输出 与 forward的输入 要对应：
         forward输出了color, radii，则 backward输入 上下文信息 ctx, forward输出的 渲染的RGB图像 的梯度 grad_out_color
         forward输入了除ctx外9个变量，则 backward返回9个梯度，不需要梯度的变量用None占位
-
-    在 backward 返回梯度时，需要确保返回的梯度数量与输入变量数量一致
 
     forward和 backward中分别调用了 _C.rasterize_gaussians和 _C.rasterize_gaussians_backward，这是C函数，其桥梁在文件./submodules/diff-gaussian-rasterization/ext.cpp中定义；
     即
@@ -65,7 +63,7 @@ class _RasterizeGaussians(torch.autograd.Function):
     def forward(
         ctx,    # 上下文信息，用于保存计算中间结果以供反向传播使用
         means3D,
-        means2D,    # 输出的 所有高斯中心投影在图像平面的坐标
+        means2D,    # 为计算 所有高斯中心投影在图像平面的坐标梯度 的占位参数
         sh,
         colors_precomp,
         opacities,
@@ -100,11 +98,14 @@ class _RasterizeGaussians(torch.autograd.Function):
 
         # 2. 光栅化（前向传播）
         # 调用 _C.rasterize_gaussians()  --  rasterize_points.cu/ RasterizeGaussiansCUDA 进行光栅化。并传入重构到一个元组中的参数
-        # 返回：所有高斯覆盖的 tile的总个数、渲染的RGB图像、每个高斯投影在当前相机图像平面上的最大半径 数组、存储所有高斯的 几何、排序、渲染后数据的tensor
+        # 返回：
+        #   所有高斯覆盖的 tile的总个数
+        #   渲染的 RGB图像
+        #   所有高斯投影在当前相机图像平面上的最大半径 数组
+        #   存储所有高斯的 几何、排序、渲染后数据的tensor
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # 先深拷贝一份输入参数，在出现异常时将其保存到文件中，以供调试
             try:
-                # 调用C++/CUDA实现的 _C.rasterize_gaussians()进行光栅化
                 num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_fw.dump")
@@ -119,17 +120,16 @@ class _RasterizeGaussians(torch.autograd.Function):
         ctx.num_rendered = num_rendered     # 渲染的tile的个数
         ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer)
 
-        # 返回 渲染的RGB图像、每个高斯投影在当前相机图像平面上的最大半径 数组
         return color, radii
 
     @staticmethod
     # 定义反向传播梯度下降的规则。调用C++/CUDA实现的 _C.rasterize_gaussians_backward方法
     # 输入：上下文信息ctx、loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
-    # 输出：loss对forward输入的9个变量（所有高斯的 中心投影到图像平面的像素坐标、中心世界坐标、椭圆二次型矩阵、不透明度、当前相机中心观测下高斯的RGB颜色、球谐系数、3D协方差矩阵、缩放因子、旋转四元数）的梯度，不需要返回梯度的变量用None占位
+    # 输出：loss对forward输入的9个变量（所有高斯的 中心3D世界坐标、中心2D投影像素坐标、球谐系数、在当前相机观测下的 RGB颜色值、不透明度、缩放因子、旋转四元数、3D协方差矩阵）的梯度，不需要返回梯度的变量用None占位
     def backward(
             ctx,    # 上下文信息
-            grad_out_color, # loss对渲染的RGB图像中每个像素颜色的 梯度
-            _):
+            grad_out_color, # loss对渲染的RGB图像中每个像素颜色 的梯度
+            grad_radii):    # loss对所有高斯投影在当前相机图像平面上的最大半径 的梯度
 
         # 从ctx中恢复前向传播输出的tensor
         num_rendered = ctx.num_rendered
@@ -161,7 +161,15 @@ class _RasterizeGaussians(torch.autograd.Function):
 
         # 2. 反向传播：计算相关tensor的梯度
         # 调用 _C.rasterize_gaussians_backward()  --  rasterize_points.cu/ RasterizeGaussiansBackwardCUDA 进行反向传播。并传入重构到一个元组中的参数
-        # 返回：loss对所有高斯的（中心2D投影像素坐标、观测的RGB颜色、不透明度、中心3D世界坐标、3D协方差矩阵、缩放因子、球谐系数、旋转四元数）的梯度
+        # 返回：
+        #   loss对所有高斯 中心2D投影像素坐标 的梯度
+        #   loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 的梯度
+        #   loss对所有高斯 不透明度 的梯度
+        #   loss对所有高斯 中心3D世界坐标 的梯度
+        #   loss对所有高斯 3D协方差矩阵 的梯度
+        #   loss对所有高斯 球谐系数 的梯度
+        #   loss对所有高斯 缩放因子 的梯度
+        #   loss对所有高斯 旋转四元数 的梯度
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # 先深拷贝一份输入参数，在出现异常时将其保存到文件中，以供调试
             try:

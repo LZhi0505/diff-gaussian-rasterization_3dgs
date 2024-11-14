@@ -475,7 +475,7 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dconic,   // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
 	float* dL_dopacity, // 输出的 loss对所有高斯 不透明度 的梯度
 	float* dL_dcolor,   // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 的梯度
-	float* dL_dmean3D,  // 输出的 loss对所有高斯 中心世界坐标 的梯度
+	float* dL_dmean3D,  // 输出的 loss对所有高斯 中心3D世界坐标 的梯度
 	float* dL_dcov3D,   // 输出的 loss对所有高斯 3D协方差矩阵 的梯度
 	float* dL_dsh,      // 输出的 loss对所有高斯 球谐系数 的梯度
 	float* dL_dscale,   // 输出的 loss对所有高斯 缩放因子 的梯度
@@ -519,13 +519,10 @@ void CudaRasterizer::Rasterizer::backward(
 		(float3*)dL_dmean2D,    // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度
 		(float4*)dL_dconic,     // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
 		dL_dopacity,            // 输出的 loss对所有高斯 不透明度 的梯度
-		dL_dcolor),     // 输出的 loss对所有高斯 RGB颜色 的梯度
+		dL_dcolor),             // 输出的 loss对所有高斯 RGB颜色 的梯度
         debug)
 
-	// Take care of the rest of preprocessing. Was the precomputed covariance
-	// given to us or a scales/rot pair? If precomputed, pass that. If not,
-	// use the one we computed ourselves.
-    // 处理预处理的剩余部分
+
     // 如果传入的预计算3D协方差矩阵 不是空指针，则是预计算的3D协方差矩阵
     //                         是空指针（默认），则是 preprocess中计算的 所有高斯 在世界坐标系下的3D协方差矩阵
 	const float* cov3D_ptr = (cov3D_precomp != nullptr) ? cov3D_precomp : geomState.cov3D;
@@ -548,12 +545,12 @@ void CudaRasterizer::Rasterizer::backward(
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
 		(glm::vec3*)campos,     // 当前相机中心的世界坐标
-		(float3*)dL_dmean2D,    // 反传渲染部分计算的 loss对所有高斯 中心2D投影像素坐标 的梯度
-		dL_dconic,              // 反传渲染部分计算的 loss对所有高斯 2D协方差矩阵 的梯度
-		(glm::vec3*)dL_dmean3D,     // 输出的 loss对所有高斯 中心世界坐标 的梯度
-		dL_dcolor,           // 反传渲染部分计算的 loss对所有高斯 RGB颜色 的梯度
-		dL_dcov3D,          // 输出的 loss对所有高斯 3D协方差矩阵 的梯度
-		dL_dsh,             // 输出的 loss对所有高斯 球谐系数 的梯度
+		(float3*)dL_dmean2D,    // 反传render部分计算的 loss对所有高斯 中心2D投影像素坐标 的梯度
+		dL_dconic,              // 反传render部分计算的 loss对所有高斯 2D协方差矩阵 的梯度
+		(glm::vec3*)dL_dmean3D,     // 输出的 loss对所有高斯 中心3D世界坐标 的梯度
+		dL_dcolor,              // 反传render部分计算的 loss对所有高斯 RGB颜色 的梯度
+		dL_dcov3D,                  // 输出的 loss对所有高斯 3D协方差矩阵 的梯度
+		dL_dsh,                     // 输出的 loss对所有高斯 球谐系数 的梯度
 		(glm::vec3*)dL_dscale,      // 输出的 loss对所有高斯 缩放因子 的梯度
 		(glm::vec4*)dL_drot),       // 输出的 loss对所有高斯 旋转四元数 的梯度
         debug)

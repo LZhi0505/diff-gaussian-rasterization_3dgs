@@ -350,7 +350,7 @@ renderCUDA(
 	float2 pixf = { (float)pix.x, (float)pix.y };   // 当前处理的 像素 在像素平面的坐标(float)
 
     // 2. 判断当前线程处理的 像素 是否在图像有效像素范围内
-	bool inside = pix.x < W　&& pix.y < H;
+	bool inside = pix.x < W && pix.y < H;
     // 如果不在，则将 done设为 true，表示该线程不执行渲染操作
 	bool done = !inside;
 
@@ -407,9 +407,6 @@ renderCUDA(
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };    // 当前处理的像素 到 当前2D高斯中心像素坐标的 位移向量
 			float4 con_o = collected_conic_opacity[j];          // 当前高斯的 2D协方差矩阵的逆 和 不透明度，x、y、z: 分别是2D协方差逆矩阵的上半对角元素, w：不透明度
 
-            // 另：一个高斯对渲染某个像素的贡献度 = 光线经之前高斯后剩余的能量 * 该高斯对光线的吸收程度
-            //                             = 光线经之前高斯累积的透射率 T * 当前高斯的alpha（该高斯的不透明度 * 其2D高斯的投影分布）
-
             // (1) 计算 当前高斯对光线的吸收程度 alpha（3DGS论文公式(2)中的α值）
             // 当前2D高斯分布的指数部分：-1/2 d^T Σ^-1 d
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
@@ -430,10 +427,14 @@ renderCUDA(
 				continue;
 			}
 
+            // 一个高斯对渲染某个像素的贡献度 = 光线经之前高斯后剩余的能量 * 该高斯对光线的吸收程度
+            //                           = 光线经之前高斯累积的透射率 T * 当前高斯的alpha
+            const float aT = alpha * T;
+
             // (3) α-blending计算当前像素的RGB三通道 颜色值 C（3DGS论文公式(3)）
 			for (int ch = 0; ch < CHANNELS; ch++)
                 // 每个通道的颜色 = 累加 当前高斯的颜色 * 当前高斯的贡献度
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+				C[ch] += features[collected_id[j] * CHANNELS + ch] * aT;
 
 			T = test_T; // 更新经之前高斯累积的透射率
 
