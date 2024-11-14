@@ -75,6 +75,55 @@ uint32_t getHigherMsb(uint32_t n)
 	return msb;
 }
 
+__device__ inline float evaluate_opacity_factor(const float dx, const float dy, const float4 co) {
+	return 0.5f * (co.x * dx * dx + co.z * dy * dy) + co.y * dx * dy;
+}
+
+template<uint32_t PATCH_WIDTH, uint32_t PATCH_HEIGHT>
+__device__ inline float max_contrib_power_rect_gaussian_float(
+	const float4 co,
+	const float2 mean,
+	const glm::vec2 rect_min,
+	const glm::vec2 rect_max,
+	glm::vec2& max_pos)
+{
+	const float x_min_diff = rect_min.x - mean.x;
+	const float x_left = x_min_diff > 0.0f;
+	// const float x_left = mean.x < rect_min.x;
+	const float not_in_x_range = x_left + (mean.x > rect_max.x);
+
+	const float y_min_diff = rect_min.y - mean.y;
+	const float y_above =  y_min_diff > 0.0f;
+	// const float y_above = mean.y < rect_min.y;
+	const float not_in_y_range = y_above + (mean.y > rect_max.y);
+
+	max_pos = {mean.x, mean.y};
+	float max_contrib_power = 0.0f;
+
+	if ((not_in_y_range + not_in_x_range) > 0.0f)
+	{
+		const float px = x_left * rect_min.x + (1.0f - x_left) * rect_max.x;
+		const float py = y_above * rect_min.y + (1.0f - y_above) * rect_max.y;
+
+		const float dx = copysign(float(PATCH_WIDTH), x_min_diff);
+		const float dy = copysign(float(PATCH_HEIGHT), y_min_diff);
+
+		const float diffx = mean.x - px;
+		const float diffy = mean.y - py;
+
+		const float rcp_dxdxcox = __frcp_rn(PATCH_WIDTH * PATCH_WIDTH * co.x); // = 1.0 / (dx*dx*co.x)
+		const float rcp_dydycoz = __frcp_rn(PATCH_HEIGHT * PATCH_HEIGHT * co.z); // = 1.0 / (dy*dy*co.z)
+
+		const float tx = not_in_y_range * __saturatef((dx * co.x * diffx + dx * co.y * diffy) * rcp_dxdxcox);
+		const float ty = not_in_x_range * __saturatef((dy * co.y * diffx + dy * co.z * diffy) * rcp_dydycoz);
+		max_pos = {px + tx * dx, py + ty * dy};
+
+		const float2 max_pos_diff = {mean.x - max_pos.x, mean.y - max_pos.y};
+		max_contrib_power = evaluate_opacity_factor(max_pos_diff.x, max_pos_diff.y, co);
+	}
+
+	return max_contrib_power;
+}
 
 
 /**
@@ -104,12 +153,14 @@ __global__ void checkFrustum(
 __global__ void duplicateWithKeys(
 	int P,      // 所有高斯的个数
 	const float2* points_xy,    // 预处理计算的 所有高斯 中心在当前相机图像平面的二维坐标 数组
-	const float* depths,        // 预处理计算的 所有高斯 中心在当前相机坐标系下的z值（深度）数组
+    const float4* __restrict__ conic_opacity,   // 预处理计算的 所有高斯 2D协方差的逆 和 不透明度 数组
+    const float* depths,        // 预处理计算的 所有高斯 中心在当前相机坐标系下的z值（深度）数组
 	const uint32_t* offsets,    // 所有高斯 覆盖的 tile个数的 前缀和 数组
 	uint64_t* gaussian_keys_unsorted,   // 输出的 遍历所有高斯生成它们覆盖的tile的 且 未排序的 keys 列表。每个元素64bit，高32位存某高斯覆盖的tile_ID，低32位存某高斯中心在相机坐标系下的z（深度）值
 	uint32_t* gaussian_values_unsorted, // 输出的 遍历所有高斯生成它们覆盖的tile的 且 未排序的 values 列表。每个元素是 某高斯的ID
 	int* radii,     // 预处理计算的 所有高斯 投影在当前相机图像平面的最大半径 数组
-	dim3 grid)      // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
+	dim3 grid,      // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
+    int2* rects)
 {
     // 获取当前线程处理的高斯的索引
 	auto idx = cg::this_grid().thread_rank();
@@ -121,25 +172,55 @@ __global__ void duplicateWithKeys(
 	{
         // 该高斯 前面的那些高斯已经覆盖的 tile的总数，即前一个高斯覆盖的tile的终止位置，也是该高斯覆盖的tile的起始位置
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
+        const uint32_t offset_to = offsets[idx];
         // 计算该高斯投影到当前相机图像平面的 覆盖区域的左上角和右下角 tile块坐标
 		uint2 rect_min, rect_max;
-		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+
+        if(rects == nullptr)
+		    getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+        else
+            getRect(points_xy[idx], rects[idx], rect_min, rect_max, grid);
+
+        const float2 xy = points_xy[idx];
+        const float4 co = conic_opacity[idx];
+        const float opacity_threshold = 1.0f / 255.0f;
+        const float opacity_factor_threshold = logf(co.w / opacity_threshold);
 
         // 遍历该高斯 覆盖的每个 tile，为其生成一个 key-value：tile_ID|高斯深度 - 该高斯的ID
 		for (int y = rect_min.y; y < rect_max.y; y++)
 		{
 			for (int x = rect_min.x; x < rect_max.x; x++)
 			{
+                const glm::vec2 tile_min(x * BLOCK_X, y * BLOCK_Y);
+                const glm::vec2 tile_max((x + 1) * BLOCK_X - 1, (y + 1) * BLOCK_Y - 1);
+
+                glm::vec2 max_pos;
+                float max_opac_factor = 0.0f;
+                max_opac_factor = max_contrib_power_rect_gaussian_float<BLOCK_X-1, BLOCK_Y-1>(co, xy, tile_min, tile_max, max_pos);
+
 				uint64_t key = y * grid.x + x;  // tile在整幅图像的 ID
 				key <<= 32;         // 高位存 tile ID
 				key |= *((uint32_t*) & depths[idx]);      // 低位存 该3D高斯在当前相机坐标系下的 深度
 
                 // 为该高斯覆盖的当前 tile 分配 key-value
-                gaussian_keys_unsorted[off] = key;
-				gaussian_values_unsorted[off] = idx;
-				off++;      // tile数组中的偏移量
+                if (max_opac_factor <= opacity_factor_threshold)
+                {
+                    gaussian_keys_unsorted[off] = key;
+                    gaussian_values_unsorted[off] = idx;
+                    off++;      // tile数组中的偏移量
+                }
 			}
 		}
+
+        for (; off < offset_to; ++off)
+        {
+            uint64_t key = (uint32_t) -1;
+            key <<= 32;
+            const float depth = FLT_MAX;
+            key |= *((uint32_t*)&depth);
+            gaussian_values_unsorted[off] = static_cast<uint32_t>(-1);
+            gaussian_keys_unsorted[off] = key;
+        }
 	}
 }
 
@@ -160,6 +241,8 @@ __global__ void identifyTileRanges(
     // 读取 当前线程处理的 key，[tile ID | 深度]
 	uint64_t key = point_list_keys[idx];
 	uint32_t currtile = key >> 32;  // 当前tile的ID
+    bool valid_tile = currtile != (uint32_t) -1;
+
 	if (idx == 0)
         // 如果是第一个 tile，则其起始位置在索引 0 处
 		ranges[currtile].x = 0;
@@ -170,14 +253,26 @@ __global__ void identifyTileRanges(
 		if (currtile != prevtile)
 		{
 			ranges[prevtile].y = idx;   // 前一个 tile的终止位置是当前索引 idx
-			ranges[currtile].x = idx;   // 当前 tile的起始位置也是 idx
+            if (valid_tile)
+			    ranges[currtile].x = idx;   // 当前 tile的起始位置也是 idx
 		}
 	}
-	if (idx == L - 1)
+	if (idx == L - 1 && valid_tile)
         // 如果是最后一个 tile，则其终止位置在索引 L 处
 		ranges[currtile].y = L;
 }
 
+// for each tile, see how many buckets/warps are needed to store the state
+__global__ void perTileBucketCount(int T, uint2* ranges, uint32_t* bucketCount) {
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= T)
+		return;
+
+	uint2 range = ranges[idx];
+	int num_splats = range.y - range.x;
+	int num_buckets = (num_splats + 31) / 32;
+	bucketCount[idx] = (uint32_t) num_buckets;
+}
 
 /**
  * 检查所有高斯是否在当前相机的视锥体内
@@ -235,7 +330,29 @@ CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, s
 	obtain(chunk, img.accum_alpha, N, 128); // 渲染后每个像素 pixel的 累积的透射率 的数组
 	obtain(chunk, img.n_contrib, N, 128);   // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 	obtain(chunk, img.ranges, N, 128);      // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数
-	return img;
+    int* dummy = nullptr;
+    int* wummy = nullptr;
+    cub::DeviceScan::InclusiveSum(nullptr, img.scan_size, dummy, wummy, N);
+    obtain(chunk, img.contrib_scan, img.scan_size, 128);
+
+    obtain(chunk, img.max_contrib, N, 128);
+    obtain(chunk, img.pixel_colors, N * NUM_CHANNELS, 128);
+    obtain(chunk, img.pixel_invDepths, N, 128);
+    obtain(chunk, img.bucket_count, N, 128);
+    obtain(chunk, img.bucket_offsets, N, 128);
+    cub::DeviceScan::InclusiveSum(nullptr, img.bucket_count_scan_size, img.bucket_count, img.bucket_count, N);
+    obtain(chunk, img.bucket_count_scanning_space, img.bucket_count_scan_size, 128);
+
+    return img;
+}
+
+CudaRasterizer::SampleState CudaRasterizer::SampleState::fromChunk(char *& chunk, size_t C) {
+	SampleState sample;
+	obtain(chunk, sample.bucket_to_tile, C * BLOCK_SIZE, 128);
+	obtain(chunk, sample.T, C * BLOCK_SIZE, 128);
+	obtain(chunk, sample.ar, NUM_CHANNELS * C * BLOCK_SIZE, 128);
+	obtain(chunk, sample.ard, C * BLOCK_SIZE, 128);
+	return sample;
 }
 
 /**
@@ -261,6 +378,24 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
 	return binning;
 }
 
+__global__ void zero(int N, int* space)
+{
+	int idx = threadIdx.x + blockDim.x * blockIdx.x;
+	if(idx >= N)
+		return;
+	space[idx] = 0;
+}
+
+__global__ void set(int N, uint32_t* where, int* space)
+{
+	int idx = threadIdx.x + blockDim.x * blockIdx.x;
+	if(idx >= N)
+		return;
+
+	int off = (idx == 0) ? 0 : where[idx-1];
+
+	space[off] = 1;
+}
 
 /**
  * 可微光栅化的 前向传播，可当作 main 函数
@@ -269,17 +404,19 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
  * 3: 分配 num_tiles个 block，每个 block有 256个 thread，对每个 pixel做渲染
  * return：num_rendered：所有高斯 投影到二维图像平面上覆盖的 tile的总个数 = 排序列表的长度
  */
-int CudaRasterizer::Rasterizer::forward(
+std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 	std::function<char* (size_t)> geometryBuffer,   // 三个都是调整内存缓冲区的函数指针
 	std::function<char* (size_t)> binningBuffer,
 	std::function<char* (size_t)> imageBuffer,
+    std::function<char* (size_t)> sampleBuffer,
 	const int P,    // 所有高斯的个数
     int D,      // 当前的球谐阶数
-    int M,      // 每个高斯的球谐系数个数=16
+    int M,      // 每个高斯的球谐系数个数=16 / 15
 	const float* background,    // 背景颜色，默认为[0,0,0]，黑色
 	const int width, int height,    // 图像宽、高
 	const float* means3D,   // 所有高斯 中心的世界坐标
-	const float* shs,       // 所有高斯的 球谐系数
+    const float* dc,        // 空tensor            或 所有高斯的 球谐系数直流分量，(N,1,3)
+    const float* shs,       // 所有高斯的 全部球谐系数 或 剩余分量，(N,16,3) or (N,15,3)
 	const float* colors_precomp,    // 因预计算的颜色默认是空tensor，则其传入的是一个 NULL指针
 	const float* opacities, // 所有高斯的 不透明度
 	const float* scales,    // 所有高斯的 缩放因子
@@ -292,7 +429,8 @@ int CudaRasterizer::Rasterizer::forward(
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,     // 预滤除的标志，默认为False
 	float* out_color,       // 输出的 RGB图像，考虑了背景颜色，(3,H,W)
-	int* radii,             // 输出的 所有高斯 投影在当前相机图像平面的最大半径 数组，(N,)
+    bool antialiasing,      // 是否 抗锯齿
+    int* radii,             // 输出的 所有高斯 投影在当前相机图像平面的最大半径 数组，(N,)
 	bool debug)     // 默认为False
 {
     // 1. 计算焦距，W = 2fx * tan(Fovx/2) ==> fx = W / (2 * tan(Fovx/2))
@@ -335,6 +473,7 @@ int CudaRasterizer::Rasterizer::forward(
 		scale_modifier,
 		(glm::vec4*)rotations,
 		opacities,
+		dc,
 		shs,
 		geomState.clamped,      // 输出的 所有高斯 是否被裁剪的标志 数组，某位置为True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
 		cov3D_precomp,          // 因预计算的3D协方差矩阵默认是空tensor，则传入的是一个 NULL指针
@@ -352,7 +491,8 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.conic_opacity,    // 输出的 所有高斯 2D协方差的逆 和 不透明度 数组
 		tile_grid,                  // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
 		geomState.tiles_touched,    // 输出的 所有高斯 在当前相机图像平面覆盖的线程块 tile的个数 数组
-		prefiltered                 // 预滤除的标志，默认为False
+		prefiltered,                // 预滤除的标志，默认为False
+        antialiasing                // 是否 抗锯齿
 	), debug)
 
     //! 6. 高斯排序：根据高斯距离摄像机的远近来并行计算 每个高斯在 α-blending中的顺序
@@ -381,12 +521,14 @@ int CudaRasterizer::Rasterizer::forward(
 	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
 		P,
 		geomState.means2D,  // 预处理计算的 所有高斯 中心在当前相机图像平面的二维坐标 数组
-		geomState.depths,   // 预处理计算的 所有高斯 中心在当前相机坐标系下的z值（深度） 数组
+        geomState.conic_opacity,    // 预处理计算的 所有高斯 2D协方差的逆 和 不透明度 数组
+        geomState.depths,   // 预处理计算的 所有高斯 中心在当前相机坐标系下的z值（深度） 数组
 		geomState.point_offsets,    // 所有高斯覆盖的 tile个数的 前缀和
 		binningState.point_list_keys_unsorted,  // 输出的 未排序的 遍历所有高斯生成它们覆盖的tile的 keys 列表，每个元素是 (tile_ID | 3D高斯的深度)
 		binningState.point_list_unsorted,       // 输出的 未排序的 遍历所有高斯生成它们覆盖的tile的 values 列表，每个元素是 对应高斯的ID
 		radii,          // 预处理计算的 所有高斯 投影在当前相机图像平面的最大半径 数组
-		tile_grid)      // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
+		tile_grid,      // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
+        nullptr)
 	CHECK_CUDA(, debug)
 
     // 计算 tile总数的 二进制数中的 最高有效位的 位置，用于确定位操作的范围
@@ -421,6 +563,17 @@ int CudaRasterizer::Rasterizer::forward(
 			imgState.ranges);   // 输出的 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 	CHECK_CUDA(, debug)
 
+ 	// bucket count
+	int num_tiles = tile_grid.x * tile_grid.y;
+	perTileBucketCount<<<(num_tiles + 255) / 256, 256>>>(num_tiles, imgState.ranges, imgState.bucket_count);
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(imgState.bucket_count_scanning_space, imgState.bucket_count_scan_size, imgState.bucket_count, imgState.bucket_offsets, num_tiles), debug)
+	unsigned int bucket_sum;
+	CHECK_CUDA(cudaMemcpy(&bucket_sum, imgState.bucket_offsets + num_tiles - 1, sizeof(unsigned int), cudaMemcpyDeviceToHost), debug);
+	// create a state to store. size is number is the total number of buckets * block_size
+	size_t sample_chunk_size = required<SampleState>(bucket_sum);
+	char* sample_chunkptr = sampleBuffer(sample_chunk_size);
+	SampleState sampleState = SampleState::fromChunk(sample_chunkptr, bucket_sum);
+
     // 如果传入的预计算的颜色 不是空指针，则是预计算的颜色
     //                    是空指针（默认），则是 preprocess中计算的 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
@@ -431,17 +584,26 @@ int CudaRasterizer::Rasterizer::forward(
         block,              // 定义的线程块 block的维度，(16, 16, 1)
 		imgState.ranges,    // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 		binningState.point_list,    // 按 tile ID、高斯深度 排序后的 values列表，即 高斯ID 列表
-		width, height,
-		geomState.means2D,  // 已计算的 所有高斯 中心在当前相机图像平面的二维坐标 数组
+        imgState.bucket_offsets,
+        sampleState.bucket_to_tile,
+        sampleState.T,
+        sampleState.ar,
+        sampleState.ard,
+        width, height,
+        geomState.means2D,  // 已计算的 所有高斯 中心在当前相机图像平面的二维坐标 数组
 		feature_ptr,        // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组（每个高斯在当前观测方向下只有一个颜色，仅颜色强度分布不同）
 		geomState.conic_opacity,    // 已计算的 所有高斯 2D协方差矩阵的逆 和 不透明度 数组
 		imgState.accum_alpha,   // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
 		imgState.n_contrib,     // 输出的 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
-		background,     // 背景颜色，默认为[0,0,0]，黑色
-		out_color               // 输出的 RGB图像（加上了背景颜色）
+        imgState.max_contrib,
+        background,     // 背景颜色，默认为[0,0,0]，黑色
+		out_color,              // 输出的 RGB图像（加上了背景颜色）
+        geomState.depths,
         ), debug)
 
-	return num_rendered;
+	CHECK_CUDA(cudaMemcpy(imgState.pixel_colors, out_color, sizeof(float) * width * height * NUM_CHANNELS, cudaMemcpyDeviceToDevice), debug);
+	CHECK_CUDA(cudaMemcpy(imgState.pixel_invDepths, invdepth, sizeof(float) * width * height, cudaMemcpyDeviceToDevice), debug);
+	return std::make_tuple(num_rendered, bucket_sum);
 }
 
 
@@ -453,11 +615,14 @@ void CudaRasterizer::Rasterizer::backward(
     int D,  // 当前的球谐阶数
     int M,  // 每个高斯的球谐系数个数=16
     int R,  // 所有高斯覆盖的 tile的总个数
+    int B,
 	const float* background,    // 背景颜色，默认为[0,0,0]，黑色
 	const int width, int height,
 	const float* means3D,   // 所有高斯 中心的世界坐标
+    const float* dc,
 	const float* shs,       // 所有高斯的 球谐系数，(N,16,3)
 	const float* colors_precomp,    // python代码中 预计算的颜色，默认是空tensor
+    const float* opacities,
 	const float* scales,    // 所有高斯的 缩放因子
 	const float scale_modifier, // 缩放因子调节系数
 	const float* rotations, // 所有高斯的 旋转四元数
@@ -470,22 +635,26 @@ void CudaRasterizer::Rasterizer::backward(
 	char* geom_buffer,  // 存储所有高斯 几何数据的 tensor：包括2D中心像素坐标、相机坐标系下的深度、3D协方差矩阵等
 	char* binning_buffer,   // 存储所有高斯 排序数据的 tensor：包括未排序和排序后的 所有高斯覆盖的tile的 keys、values列表
 	char* img_buffer,       // 存储所有高斯 渲染后数据的 tensor：包括累积的透射率、最后一个贡献的高斯ID
-	const float* dL_dpix,   // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+    char* sample_buffer,
+    const float* dL_dpix,   // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
 	float* dL_dmean2D,  // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度
 	float* dL_dconic,   // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
 	float* dL_dopacity, // 输出的 loss对所有高斯 不透明度 的梯度
 	float* dL_dcolor,   // 输出的 loss对所有高斯 在当前相机中心的观测方向下 的RGB颜色值 的梯度
 	float* dL_dmean3D,  // 输出的 loss对所有高斯 中心3D世界坐标 的梯度
 	float* dL_dcov3D,   // 输出的 loss对所有高斯 3D协方差矩阵 的梯度
-	float* dL_dsh,      // 输出的 loss对所有高斯 球谐系数 的梯度
+    float* dL_ddc,
+    float* dL_dsh,      // 输出的 loss对所有高斯 球谐系数 的梯度
 	float* dL_dscale,   // 输出的 loss对所有高斯 缩放因子 的梯度
 	float* dL_drot,     // 输出的 loss对所有高斯 旋转四元数 的梯度
+    bool antialiasing,
 	bool debug) // 默认为False
 {
     // 这些缓冲区都是在前向传播的时候存下来的，现在拿出来用
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
 	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
+	SampleState sampleState = SampleState::fromChunk(sample_buffer, B);
 
 	if (radii == nullptr) {
         // 如果传入的 所有高斯投影在当前相机图像平面上的最大半径数组为 空指针，则从geomState缓冲区中获取 所有高斯在图像平面上的投影半径
@@ -509,13 +678,23 @@ void CudaRasterizer::Rasterizer::backward(
 		imgState.ranges,    // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数
 		binningState.point_list,    // 按深度排序后的 所有高斯覆盖的tile的 values列表，每个元素是 对应高斯的ID
 		width, height,
-		background,     // 背景颜色，默认为[0,0,0]，黑色
+        R,
+        B,
+        imgState.bucket_offsets,
+        sampleState.bucket_to_tile,
+        sampleState.T,
+        sampleState.ar,
+        sampleState.ard,
+        background,     // 背景颜色，默认为[0,0,0]，黑色
 		geomState.means2D,      // 所有高斯 中心投影在当前相机图像平面的二维坐标 数组
 		geomState.conic_opacity,    // 所有高斯 2D协方差的逆 和 不透明度 数组
 		color_ptr,      // 默认是 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
-		imgState.accum_alpha,   // 渲染后每个像素 pixel的 累积的透射率 的数组
+        geomState.depths,
+        imgState.accum_alpha,   // 渲染后每个像素 pixel的 累积的透射率 的数组
 		imgState.n_contrib,     // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
-		dL_dpix,    // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
+        imgState.max_contrib,
+        imgState.pixel_colors,
+        dL_dpix,    // 输入的 loss对渲染的RGB图像中每个像素颜色 的梯度（优化器输出的值，由优化器在训练迭代中自动计算）
 		(float3*)dL_dmean2D,    // 输出的 loss对所有高斯 中心2D投影像素坐标 的梯度
 		(float4*)dL_dconic,     // 输出的 loss对所有高斯 2D协方差矩阵 的梯度
 		dL_dopacity,            // 输出的 loss对所有高斯 不透明度 的梯度
@@ -534,9 +713,11 @@ void CudaRasterizer::Rasterizer::backward(
         M,      // 每个高斯的球谐系数个数=16
 		(float3*)means3D,   // 所有高斯 中心的世界坐标
 		radii,      // 所有高斯 在图像平面上的投影半径
+        dc,
 		shs,        // 所有高斯的 球谐系数，(N,16,3)
 		geomState.clamped,      // 所有高斯 是否被裁剪的标志 数组，某位置为True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
-		(glm::vec3*)scales,     // 所有高斯的 缩放因子
+        opacities,
+        (glm::vec3*)scales,     // 所有高斯的 缩放因子
 		(glm::vec4*)rotations,  // 所有高斯的 旋转四元数
 		scale_modifier,     // 缩放因子调节系数
 		cov3D_ptr,      // 所有高斯 在世界坐标系下的3D协方差矩阵
@@ -547,11 +728,14 @@ void CudaRasterizer::Rasterizer::backward(
 		(glm::vec3*)campos,     // 当前相机中心的世界坐标
 		(float3*)dL_dmean2D,    // 反传render部分计算的 loss对所有高斯 中心2D投影像素坐标 的梯度
 		dL_dconic,              // 反传render部分计算的 loss对所有高斯 2D协方差矩阵 的梯度
-		(glm::vec3*)dL_dmean3D,     // 输出的 loss对所有高斯 中心3D世界坐标 的梯度
+        dL_dopacity,
+        (glm::vec3*)dL_dmean3D,     // 输出的 loss对所有高斯 中心3D世界坐标 的梯度
 		dL_dcolor,              // 反传render部分计算的 loss对所有高斯 RGB颜色 的梯度
 		dL_dcov3D,                  // 输出的 loss对所有高斯 3D协方差矩阵 的梯度
-		dL_dsh,                     // 输出的 loss对所有高斯 球谐系数 的梯度
+        dL_ddc,
+        dL_dsh,                     // 输出的 loss对所有高斯 球谐系数 的梯度
 		(glm::vec3*)dL_dscale,      // 输出的 loss对所有高斯 缩放因子 的梯度
-		(glm::vec4*)dL_drot),       // 输出的 loss对所有高斯 旋转四元数 的梯度
+		(glm::vec4*)dL_drot,        // 输出的 loss对所有高斯 旋转四元数 的梯度
+        antialiasing),
         debug)
 }

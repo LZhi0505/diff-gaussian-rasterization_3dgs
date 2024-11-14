@@ -53,26 +53,48 @@ namespace CudaRasterizer
 
 	struct ImageState
 	{
+        uint32_t *bucket_count;
+        uint32_t *bucket_offsets;
+        size_t bucket_count_scan_size;
+        char * bucket_count_scanning_space;
+        float* pixel_colors;
+        float* pixel_invDepths;
+        uint32_t* max_contrib;
+
+        size_t scan_size;
 		uint2* ranges;  // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile_ID；值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数
 		uint32_t* n_contrib;    // 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
 		float* accum_alpha;     // 渲染后每个像素 pixel的 累积的透射率 的数组
+        char* contrib_scan;
 
 		static ImageState fromChunk(char*& chunk, size_t N);
 	};
 
 	struct BinningState
 	{
+        size_t scan_size;
 		size_t sorting_size; // 临时显存空间的大小
 		uint64_t* point_list_keys_unsorted; // 未排序的 所有高斯覆盖的tile的 keys列表，分布顺序：大顺序：各高斯，小顺序：该高斯覆盖的各tile_ID。每个元素是 (tile_ID | 3D高斯的深度)
 		uint64_t* point_list_keys;          // 排序后的 keys列表，分布顺序：大顺序：各tile_ID，小顺序：落在该tile内各高斯的深度
 
         uint32_t* point_list_unsorted;  // 未排序的 所有高斯覆盖的tile的 values列表，每个元素是 对应高斯的ID
 		uint32_t* point_list;           // 排序后的 value列表
-		char* list_sorting_space; // 排序时用到的临时显存空间
+        int* scan_src;
+        int* scan_dst;
+        char* scan_space;
+        char* list_sorting_space; // 排序时用到的临时显存空间
 
 		static BinningState fromChunk(char*& chunk, size_t P);
 	};
 
+	struct SampleState
+	{
+		uint32_t *bucket_to_tile;
+		float *T;
+		float *ar;
+		float *ard;
+		static SampleState fromChunk(char*& chunk, size_t C);
+	};
 
     // 计算存储 T 类型数据所需的内存大小的函数
     // 通过调用 T::fromChunk 并传递一个空指针（nullptr）来模拟内存分配过程

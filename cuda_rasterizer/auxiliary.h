@@ -72,6 +72,18 @@ __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& r
 	};
 }
 
+__forceinline__ __device__ void getRect(const float2 p, int2 ext_rect, uint2& rect_min, uint2& rect_max, dim3 grid)
+{
+	rect_min = {
+		min(grid.x, max((int)0, (int)((p.x - ext_rect.x) / BLOCK_X))),
+		min(grid.y, max((int)0, (int)((p.y - ext_rect.y) / BLOCK_Y)))
+	};
+	rect_max = {
+		min(grid.x, max((int)0, (int)((p.x + ext_rect.x + BLOCK_X - 1) / BLOCK_X))),
+		min(grid.y, max((int)0, (int)((p.y + ext_rect.y + BLOCK_Y - 1) / BLOCK_Y)))
+	};
+}
+
 /**
  * 将该高斯中心从 世界坐标系 变换到 相机坐标系，即 x = matrix * p，(3,1)
  * p: 该3D高斯中心的世界坐标

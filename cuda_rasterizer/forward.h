@@ -17,6 +17,7 @@
 #include "device_launch_parameters.h"
 #define GLM_FORCE_CUDA
 #include <glm/glm.hpp>
+#include <functional>
 
 namespace FORWARD
 {
@@ -27,6 +28,7 @@ namespace FORWARD
 		const float scale_modifier,
 		const glm::vec4* rotations,
 		const float* opacities,
+		const float* dc,
 		const float* shs,
 		bool* clamped,
 		const float* cov3D_precomp,
@@ -45,21 +47,27 @@ namespace FORWARD
 		float4* conic_opacity,
 		const dim3 grid,
 		uint32_t* tiles_touched,
-		bool prefiltered);
+		bool prefiltered,
+		bool antialiasing);
 
     // 光栅化的 渲染
 	void render(
 		const dim3 grid, dim3 block,
 		const uint2* ranges,
 		const uint32_t* point_list,
+		const uint32_t* per_tile_bucket_offset, uint32_t* bucket_to_tile,
+		float* sampled_T, float* sampled_ar, float* sampled_ard,
 		int W, int H,
 		const float2* points_xy_image,
 		const float* features,
 		const float4* conic_opacity,
 		float* final_T,
 		uint32_t* n_contrib,
+		uint32_t* max_contrib,
 		const float* bg_color,
-		float* out_color);
+		float* out_color,
+		float* depths,
+		float* depth);
 }
 
 

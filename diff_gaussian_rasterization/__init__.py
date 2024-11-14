@@ -23,7 +23,8 @@ def cpu_deep_copy_tuple(input_tuple):
 def rasterize_gaussians(
     means3D,
     means2D,    # 为计算 所有高斯中心投影在图像平面的坐标梯度 的占位参数
-    sh,
+    dc,         # 空tensor            或 所有高斯的 球谐系数直流分量，(N,1,3)
+    sh,         # 所有高斯的 全部球谐系数 或 剩余分量，(N,16,3) or (N,15,3)
     colors_precomp,
     opacities,
     scales,
@@ -34,6 +35,7 @@ def rasterize_gaussians(
     return _RasterizeGaussians.apply(
         means3D,
         means2D,
+        dc,
         sh,
         colors_precomp,
         opacities,
@@ -64,7 +66,8 @@ class _RasterizeGaussians(torch.autograd.Function):
         ctx,    # 上下文信息，用于保存计算中间结果以供反向传播使用
         means3D,
         means2D,    # 为计算 所有高斯中心投影在图像平面的坐标梯度 的占位参数
-        sh,
+        dc,         # 空tensor            或 所有高斯的 球谐系数直流分量，(N,1,3)
+        sh,         # 所有高斯的 全部球谐系数 或 剩余分量，(N,16,3) or (N,15,3)
         colors_precomp,
         opacities,
         scales,
@@ -89,10 +92,12 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.tanfovy,
             raster_settings.image_height,
             raster_settings.image_width,
-            sh,                 # 所有高斯的 球谐系数，(N,16,3)
+            dc,                 # 空tensor            或 所有高斯的 球谐系数直流分量，(N,1,3)
+            sh,                 # 所有高斯的 全部球谐系数 或 剩余分量，(N,16,3) or (N,15,3)
             raster_settings.sh_degree,      # 当前的球谐阶数
             raster_settings.campos,         # 当前相机中心的世界坐标
             raster_settings.prefiltered,    # 预滤除的标志，默认为False
+            raster_settings.antialiasing,   # 是否 抗锯齿
             raster_settings.debug           # 默认为False
         )
 
@@ -100,26 +105,27 @@ class _RasterizeGaussians(torch.autograd.Function):
         # 调用 _C.rasterize_gaussians()  --  rasterize_points.cu/ RasterizeGaussiansCUDA 进行光栅化。并传入重构到一个元组中的参数
         # 返回：
         #   所有高斯覆盖的 tile的总个数
+        #
         #   渲染的 RGB图像
         #   所有高斯投影在当前相机图像平面上的最大半径 数组
         #   存储所有高斯的 几何、排序、渲染后数据的tensor
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # 先深拷贝一份输入参数，在出现异常时将其保存到文件中，以供调试
             try:
-                num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
+                num_rendered, num_buckets, color, radii, geomBuffer, binningBuffer, imgBuffer, sampleBuffer = _C.rasterize_gaussians(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_fw.dump")
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
             # 不是debug模式（默认）
-            num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
+            num_rendered, num_buckets, color, radii, geomBuffer, binningBuffer, imgBuffer, sampleBuffer = _C.rasterize_gaussians(*args)
 
         # 3. 记录前向传播输出的tensor到ctx中，用于反向传播
         ctx.raster_settings = raster_settings   # 光栅化输入参数
         ctx.num_rendered = num_rendered     # 渲染的tile的个数
-        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer)
-
+        ctx.num_buckets = num_buckets
+        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, dc, sh, opacities, geomBuffer, binningBuffer, imgBuffer, sampleBuffer)
         return color, radii
 
     @staticmethod
@@ -133,14 +139,16 @@ class _RasterizeGaussians(torch.autograd.Function):
 
         # 从ctx中恢复前向传播输出的tensor
         num_rendered = ctx.num_rendered
+        num_buckets = ctx.num_buckets
         raster_settings = ctx.raster_settings
-        colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
+        colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, dc, sh, opacities, geomBuffer, binningBuffer, imgBuffer, sampleBuffer = ctx.saved_tensors
 
         # 1. 将梯度和其他输入参数重构为 C++ 方法所期望的形式
         args = (raster_settings.bg, # 背景颜色，默认为[0,0,0]，黑色
                 means3D,    # 所有高斯 中心的世界坐标
                 radii,      # 所有高斯 投影在当前相机图像平面上的最大半径
                 colors_precomp, # python代码中 预计算的颜色，默认是空tensor
+                opacities,  # 所有高斯的 不透明度
                 scales,     # 所有高斯的 缩放因子
                 rotations,  # 所有高斯的 旋转四元数
                 raster_settings.scale_modifier,     # 缩放因子调节系数
@@ -150,13 +158,17 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raster_settings.tanfovx, 
                 raster_settings.tanfovy, 
                 grad_out_color,     # 输入的 loss对渲染的RGB图像中每个像素颜色的 梯度（优化器输出的值，由优化器在训练迭代中自动计算）
-                sh,         # 所有高斯的 球谐系数，(N,16,3)
+                dc,         # 空tensor            或 所有高斯的 球谐系数直流分量，(N,1,3)
+                sh,         # 所有高斯的 全部球谐系数 或 剩余分量，(N,16,3) or (N,15,3)
                 raster_settings.sh_degree,  # 当前的球谐阶数
                 raster_settings.campos,     # 当前相机中心的世界坐标
                 geomBuffer,     # 存储所有高斯 几何数据的 tensor：包括2D中心像素坐标、相机坐标系下的深度、3D协方差矩阵等
                 num_rendered,   # 所有高斯覆盖的 tile的总个数
                 binningBuffer,  # 存储所有高斯 排序数据的 tensor：包括未排序和排序后的 所有高斯覆盖的tile的 keys、values列表
                 imgBuffer,      # 存储所有高斯 渲染后数据的 tensor：包括累积的透射率、最后一个贡献的高斯ID
+                num_buckets,    #
+                sampleBuffer,   #
+                raster_settings.antialiasing,   # 是否使用抗锯齿
                 raster_settings.debug)  # 默认为False
 
         # 2. 反向传播：计算相关tensor的梯度
@@ -167,26 +179,28 @@ class _RasterizeGaussians(torch.autograd.Function):
         #   loss对所有高斯 不透明度 的梯度
         #   loss对所有高斯 中心3D世界坐标 的梯度
         #   loss对所有高斯 3D协方差矩阵 的梯度
-        #   loss对所有高斯 球谐系数 的梯度
+        #   loss对所有高斯 球谐系数直流分量 的梯度
+        #   loss对所有高斯 全部球谐系数 或 剩余分量 的梯度
         #   loss对所有高斯 缩放因子 的梯度
         #   loss对所有高斯 旋转四元数 的梯度
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # 先深拷贝一份输入参数，在出现异常时将其保存到文件中，以供调试
             try:
-                grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
+                grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_dc, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_bw.dump")
                 print("\nAn error occured in backward. Writing snapshot_bw.dump for debugging.\n")
                 raise ex
         else:
             # 不是debug模式（默认）
-            grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
+            grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_dc, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
 
         # 返回loss对各参数的梯度
         grads = (
             grad_means3D,   # loss对所有高斯 中心3D世界坐标 的梯度
             grad_means2D,   # loss对所有高斯 中心2D投影像素坐标 的梯度
-            grad_sh,        # loss对所有高斯 球谐系数 的梯度
+            grad_dc,        # loss对所有高斯 球谐系数直流分量 的梯度
+            grad_sh,        # loss对所有高斯 全部球谐系数 或 剩余分量 的梯度
             grad_colors_precomp,    # loss对所有高斯 在当前相机观测下的 RGB颜色值 的梯度
             grad_opacities,         # loss对所有高斯 不透明度 的梯度
             grad_scales,            # loss对所有高斯 缩放因子 的梯度
@@ -211,6 +225,7 @@ class GaussianRasterizationSettings(NamedTuple):
     campos : torch.Tensor   # 当前相机中心的世界坐标
     prefiltered : bool      # 预滤除的标志，默认为False
     debug : bool
+    antialiasing : bool     # 是否 抗锯齿
 
 # 光栅器类，继承自nn.Module类，用于光栅化3D高斯
 class GaussianRasterizer(nn.Module):
@@ -233,13 +248,14 @@ class GaussianRasterizer(nn.Module):
             
         return visible
 
-    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
+    def forward(self, means3D, means2D, opacities, dc = None, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
         """
         前向传播，进行3D高斯光栅化
             means3D: 所有高斯中心的 世界坐标
             means2D: 输出的 所有高斯中心投影在图像平面的坐标
             opacities:   所有高斯的 不透明度
-            shs:         所有高斯的 球谐系数，(N,16,3)
+            dc:          None 或 所有高斯的 球谐系数直流分量，(N,1,3)
+            shs:         所有高斯的 全部球谐系数 或 剩余分量，(N,16,3) or (N,15,3)
             colors_precomp:  预计算的颜色，默认为None，表明在光栅化预处理阶段计算
             scales:      所有高斯的 缩放因子
             rotations:   所有高斯的 旋转四元数
@@ -256,6 +272,8 @@ class GaussianRasterizer(nn.Module):
             raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
 
         # 如果某个输入参数为None，则将其初始化为空tensor
+        if dc is None:
+            dc = torch.Tensor([])
         if shs is None:
             shs = torch.Tensor([])
         if colors_precomp is None:
@@ -272,6 +290,7 @@ class GaussianRasterizer(nn.Module):
         return rasterize_gaussians(
             means3D,
             means2D,
+            dc,
             shs,
             colors_precomp,
             opacities,
@@ -281,3 +300,31 @@ class GaussianRasterizer(nn.Module):
             raster_settings, 
         )
 
+class SparseGaussianAdam(torch.optim.Adam):
+    def __init__(self, params, lr, eps):
+        super().__init__(params=params, lr=lr, eps=eps)
+
+    @torch.no_grad()
+    def step(self, visibility, N):
+        for group in self.param_groups:
+            lr = group["lr"]
+            eps = group["eps"]
+
+            assert len(group["params"]) == 1, "more than one tensor in group"
+            param = group["params"][0]
+            if param.grad is None:
+                continue
+
+            # Lazy state initialization
+            state = self.state[param]
+            if len(state) == 0:
+                state['step'] = torch.tensor(0.0, dtype=torch.float32)
+                state['exp_avg'] = torch.zeros_like(param, memory_format=torch.preserve_format)
+                state['exp_avg_sq'] = torch.zeros_like(param, memory_format=torch.preserve_format)
+
+
+            stored_state = self.state.get(param, None)
+            exp_avg = stored_state["exp_avg"]
+            exp_avg_sq = stored_state["exp_avg_sq"]
+            M = param.numel() // N
+            _C.adamUpdate(param, param.grad, exp_avg, exp_avg_sq, visibility, lr, 0.9, 0.999, eps, N, M)

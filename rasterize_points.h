@@ -15,7 +15,7 @@
 #include <tuple>
 #include <string>
 	
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -37,12 +37,13 @@ RasterizeGaussiansCUDA(
 	const bool prefiltered,
 	const bool debug);
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
  	const torch::Tensor& background,
 	const torch::Tensor& means3D,
 	const torch::Tensor& radii,
     const torch::Tensor& colors,
+	const torch::Tensor& opacities,
 	const torch::Tensor& scales,
 	const torch::Tensor& rotations,
 	const float scale_modifier,
@@ -52,6 +53,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const float tan_fovx, 
 	const float tan_fovy,
     const torch::Tensor& dL_dout_color,
+	const torch::Tensor& dc,
 	const torch::Tensor& sh,
 	const int degree,
 	const torch::Tensor& campos,
@@ -59,9 +61,43 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const int R,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
+	const int B,
+	const torch::Tensor& sampleBuffer,
+	const bool antialiasing,
 	const bool debug);
 		
 torch::Tensor markVisible(
 		torch::Tensor& means3D,
 		torch::Tensor& viewmatrix,
 		torch::Tensor& projmatrix);
+
+void adamUpdate(
+	torch::Tensor &param,
+	torch::Tensor &param_grad,
+	torch::Tensor &exp_avg,
+	torch::Tensor &exp_avg_sq,
+	torch::Tensor &visible,
+	const float lr,
+	const float b1,
+	const float b2,
+	const float eps,
+	const uint32_t N,
+	const uint32_t M
+);
+
+torch::Tensor
+fusedssim(
+    float C1,
+    float C2,
+    torch::Tensor &img1,
+    torch::Tensor &img2
+);
+
+torch::Tensor
+fusedssim_backward(
+    float C1,
+    float C2,
+    torch::Tensor &img1,
+    torch::Tensor &img2,
+    torch::Tensor &dL_dmap
+);

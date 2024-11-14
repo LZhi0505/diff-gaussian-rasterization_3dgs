@@ -11,6 +11,10 @@
 
 #include "forward.h"
 #include "auxiliary.h"
+#include <cuda.h>
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+#include <cub/cub.cuh>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
@@ -29,54 +33,56 @@ namespace cg = cooperative_groups;
  * 根据一个3D高斯的球谐系数，计算 当前相机中心 看向 该高斯中心 方向的 该高斯单一的RGB颜色值，(3,)
  * @param idx   当前高斯的索引
  * @param deg   当前的球谐阶数
- * @param max_coeffs    每个高斯的球谐系数个数=16
+ * @param max_coeffs    每个高斯的球谐系数个数=16 / 15
  * @param means 所有高斯 中心的世界坐标
  * @param campos 当前相机中心的世界坐标
- * @param shs    所有高斯的 球谐系数
+ * @param dc     空tensor            或 所有高斯的 球谐系数直流分量，(N,1,3)
+ * @param shs    所有高斯的 全部球谐系数 或 剩余分量，(N,16,3) or (N,15,3)
  * @param clamped   输出的 所有高斯 是否被裁剪的标志 数组，某位置为 True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
  */
-__device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, bool* clamped)
+__device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* dc, const float* shs, bool* clamped)
 {
 	// 该函数基于zhang等人的论文"Differentiable Point-Based Radiance Fields for Efficient View Synthesis"中的代码实现
 	glm::vec3 pos = means[idx];		// 当前高斯中心 的世界坐标
 	glm::vec3 dir = pos - campos;	// 从 相机中心 指向 当前高斯中心的 单位向量
 	dir = dir / glm::length(dir);
 
-	glm::vec3* sh = ((glm::vec3*)shs) + idx * max_coeffs;   // 获取当前高斯的球谐系数(16, 3)
+    glm::vec3* direct_color = ((glm::vec3*)dc) + idx;       // 获取当前高斯的球谐系数的直流分量(16 / 15, 3)
+	glm::vec3* sh = ((glm::vec3*)shs) + idx * max_coeffs;   // 获取当前高斯的球谐系数(16 / 15, 3)
 
     // 基函数(SH_C0、SH_C1等) * 系数(sh) = 最终的球谐函数
 
     // 计算当前高斯的0阶SH系数的颜色值，(3,)
-	glm::vec3 result = SH_C0 * sh[0];
+	glm::vec3 result = SH_C0 * direct_color[0];
 
 	if (deg > 0) {
         // 当前的球谐阶数 > 0，则计算 一阶SH系数的颜色值
 		float x = dir.x;
 		float y = dir.y;
 		float z = dir.z;
-		result = result - SH_C1 * y * sh[1] + SH_C1 * z * sh[2] - SH_C1 * x * sh[3];
+		result = result - SH_C1 * y * sh[0] + SH_C1 * z * sh[1] - SH_C1 * x * sh[2];
 
 		if (deg > 1) {
             // 当前的球谐阶数 > 1，则计算 二阶SH系数的颜色值
 			float xx = x * x, yy = y * y, zz = z * z;
 			float xy = x * y, yz = y * z, xz = x * z;
 			result = result +
-				SH_C2[0] * xy * sh[4] +
-				SH_C2[1] * yz * sh[5] +
-				SH_C2[2] * (2.0f * zz - xx - yy) * sh[6] +
-				SH_C2[3] * xz * sh[7] +
-				SH_C2[4] * (xx - yy) * sh[8];
+				SH_C2[0] * xy * sh[3] +
+				SH_C2[1] * yz * sh[4] +
+				SH_C2[2] * (2.0f * zz - xx - yy) * sh[5] +
+				SH_C2[3] * xz * sh[6] +
+				SH_C2[4] * (xx - yy) * sh[7];
 
 			if (deg > 2) {
                 // 当前的球谐阶数 > 2，则计算 三阶SH系数的颜色值
 				result = result +
-					SH_C3[0] * y * (3.0f * xx - yy) * sh[9] +
-					SH_C3[1] * xy * z * sh[10] +
-					SH_C3[2] * y * (4.0f * zz - xx - yy) * sh[11] +
-					SH_C3[3] * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * sh[12] +
-					SH_C3[4] * x * (4.0f * zz - xx - yy) * sh[13] +
-					SH_C3[5] * z * (xx - yy) * sh[14] +
-					SH_C3[6] * x * (xx - 3.0f * yy) * sh[15];
+					SH_C3[0] * y * (3.0f * xx - yy) * sh[8] +
+					SH_C3[1] * xy * z * sh[9] +
+					SH_C3[2] * y * (4.0f * zz - xx - yy) * sh[10] +
+					SH_C3[3] * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * sh[11] +
+					SH_C3[4] * x * (4.0f * zz - xx - yy) * sh[12] +
+					SH_C3[5] * z * (xx - yy) * sh[13] +
+					SH_C3[6] * x * (xx - 3.0f * yy) * sh[14];
 			}
 		}
 	}
@@ -205,13 +211,14 @@ template<int C>
 __global__ void preprocessCUDA(
     int P,  // 所有高斯的个数
     int D,  // 当前的球谐阶数
-    int M,  // 每个高斯的球谐系数个数=16
+    int M,  // 每个高斯的球谐系数个数=16 / 15
 	const float* orig_points,   // 所有高斯 中心的世界坐标 数组，(x0, y0, z0, ..., xn, yn, zn)
 	const glm::vec3* scales,    // 所有高斯的 缩放因子
 	const float scale_modifier, // 缩放因子的调整系数
 	const glm::vec4* rotations, // 所有高斯的 旋转四元数
 	const float* opacities,     // 所有高斯的 不透明度
-	const float* shs,           // 所有高斯的 球谐系数
+    const float* dc,            // 空tensor            或 所有高斯的 球谐系数直流分量，(N,1,3)
+	const float* shs,           // 所有高斯的 全部球谐系数 或 剩余分量，(N,16,3) or (N,15,3)
 	bool* clamped,              // 输出的 所有高斯 是否被裁剪的标志 数组，某位置为 True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
 	const float* cov3D_precomp, // 因预计算的3D协方差矩阵默认是空tensor，则传入的是一个 NULL指针
 	const float* colors_precomp,    // 因预计算的颜色默认是空tensor，则传入的是一个 NULL指针
@@ -229,7 +236,8 @@ __global__ void preprocessCUDA(
 	float4* conic_opacity,      // 输出的 所有高斯 2D协方差的逆 和 不透明度 数组
 	const dim3 grid,            // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
 	uint32_t* tiles_touched,    // 输出的 所有高斯 在当前相机图像平面覆盖的线程块 tile的个数 数组
-	bool prefiltered)           // 预滤除的标志，默认为False
+	bool prefiltered,           // 预滤除的标志，默认为False
+    bool antialiasing)          // 是否 抗锯齿
 {
     // 1. 获取当前线程在CUDA grid中的全局索引，即当前线程处理的高斯的索引
 	auto idx = cg::this_grid().thread_rank();
@@ -271,8 +279,19 @@ __global__ void preprocessCUDA(
     // 2D协方差矩阵（只存了上半角元素，3个）
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
 
+    constexpr float h_var = 0.3f;
+    const float det_cov = cov.x * cov.z - cov.y * cov.y;    // 2x2方阵 xyyz的行列式 = xz - y^2
+    cov.x += h_var;
+    cov.z += h_var;
+    const float det_cov_plus_h_cov = cov.x * cov.z - cov.y * cov.y;
+    float h_convolution_scaling = 1.0f;
+
+	if (antialiasing)
+        h_convolution_scaling = sqrt(max(0.000025f, det_cov / det_cov_plus_h_cov)); // max for numerical stability
+
     // 5. 计算2D协方差矩阵的 逆，用于EWA滤波算法
-	float det = (cov.x * cov.z - cov.y * cov.y);    // 2x2方阵 xyyz的行列式 = xz - y^2
+	const float det = det_cov_plus_h_cov;
+
 	if (det == 0.0f)
         // 行列式为0，该矩阵 不可逆，则直接返回
 		return;
@@ -301,7 +320,7 @@ __global__ void preprocessCUDA(
     // 7. 如果提供了预计算的颜色，则直接使用
 	if (colors_precomp == nullptr) {
         // 默认，未预计算颜色，则根据 该高斯的球谐系数 与 当前相机看该高斯的方向 计算该观测下的RGB颜色值，(3,)，同时如果某个RGB值<0，则在 clamped数组对应位置中置为 True
-		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
+		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, dc, shs, clamped);
 		rgb[idx * C + 0] = result.x;    // C为模版参数，表示通道数，这里是3
 		rgb[idx * C + 1] = result.y;
 		rgb[idx * C + 2] = result.z;
@@ -311,8 +330,13 @@ __global__ void preprocessCUDA(
 	depths[idx] = p_view.z; // 该高斯中心在相机坐标系下的z值
 	radii[idx] = my_radius; // 该高斯投影在图像平面的最大半径
 	points_xy_image[idx] = point_image; // 该高斯中心在图像平面的二维坐标
-	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };     // 该高斯的2D协方差矩阵的逆、不透明度
-	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x); // 该高斯投影最大半径画的圆 在屏幕空间覆盖的tile数量，用于渲染的优化
+
+    // Inverse 2D covariance and opacity neatly pack into one float4
+    float opacity = opacities[idx];
+
+    conic_opacity[idx] = { conic.x, conic.y, conic.z, opacity * h_convolution_scaling};     // 该高斯的2D协方差矩阵的逆、不透明度
+
+    tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x); // 该高斯投影最大半径画的圆 在屏幕空间覆盖的tile数量，用于渲染的优化
 }
 
 
@@ -326,14 +350,17 @@ __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)    // CUDA 启动核函数�
 renderCUDA(
 	const uint2* __restrict__ ranges,   // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 	const uint32_t* __restrict__ point_list,    // 排序后的 values列表，每个元素是按（大顺序：各tile_ID，小顺序：落在该tile内各高斯的深度）排序后的 高斯ID
-	int W, int H,
+    const uint32_t* __restrict__ per_tile_bucket_offset, uint32_t* __restrict__ bucket_to_tile,
+    float* __restrict__ sampled_T, float* __restrict__ sampled_ar, float* __restrict__ sampled_ard,
+    int W, int H,
 	const float2* __restrict__ points_xy_image, // 所有高斯 中心在当前相机图像平面的二维坐标 的数组
 	const float* __restrict__ features,         // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float4* __restrict__ conic_opacity,   // 所有高斯 2D协方差矩阵的逆 和 不透明度 的数组
 	float* __restrict__ final_T,                // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
 	uint32_t* __restrict__ n_contrib,           // 输出的 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
-	const float* __restrict__ bg_color,         // 提供的背景颜色，默认为[0,0,0]，黑色
-	float* __restrict__ out_color)              // 输出的 RGB图像（加上了背景颜色）
+    uint32_t* __restrict__ max_contrib,
+    const float* __restrict__ bg_color,         // 提供的背景颜色，默认为[0,0,0]，黑色
+    float* __restrict__ out_color)              // 输出的 RGB图像（加上了背景颜色）
 {
     // 1. 确定当前block处理的 tile的像素范围
 	auto block = cg::this_thread_block();   // 获取当前线程所处的 block（对应一个 tile）
@@ -357,10 +384,23 @@ renderCUDA(
     // 3. 计算当前tile触及的高斯个数，太多，则分rounds批渲染
     // 根据当前处理的 tile_ID，获取该tile在排序后的keys列表中的起始、终止位置，[x,y)。个数y-x：投影到该tile上的高斯的个数。
     // 也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
-	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+    uint32_t tile_id = block.group_index().y * horizontal_blocks + block.group_index().x;
+	uint2 range = ranges[tile_id];
 
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE); // 高斯个数过多，则分批处理，每批最多处理 BLOCK_SIZE=16*16个高斯
 	int toDo = range.y - range.x;   // 当前tile还未处理的 高斯的个数
+
+    // what is the number of buckets before me? what is my offset?
+    uint32_t bbm = tile_id == 0 ? 0 : per_tile_bucket_offset[tile_id - 1];
+    // let's first quickly also write the bucket-to-tile mapping
+    int num_buckets = (toDo + 31) / 32;
+    for (int i = 0; i < (num_buckets + BLOCK_SIZE - 1) / BLOCK_SIZE; ++i)
+    {
+        int bucket_idx = i * BLOCK_SIZE + block.thread_rank();
+        if (bucket_idx < num_buckets) {
+            bucket_to_tile[bbm + bucket_idx] = tile_id;
+        }
+    }
 
     // 4. 初始化同一block中的各线程共享的三个显存数组，用于在该block内共享数据
 	__shared__ int collected_id[BLOCK_SIZE];        // 记录各线程处理的 高斯ID
@@ -388,7 +428,6 @@ renderCUDA(
 		{
             // 当前线程处理的高斯的ID
 			int coll_id = point_list[range.x + progress];
-
             collected_id[block.thread_rank()] = coll_id;    // 当前线程处理的 高斯ID
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];   // 当前线程处理的 高斯中心在当前相机图像平面的 像素坐标
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];  // 当前线程处理的 高斯 2D协方差矩阵的逆 和 不透明度
@@ -397,7 +436,17 @@ renderCUDA(
 
 
         // 内循环：每个线程遍历 当前批次的高斯，进行基于锥体参数的渲染计算，并更新颜色信息
-		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++) {
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+        {
+            // add incoming T value for every 32nd gaussian
+            if (j % 32 == 0) {
+                sampled_T[(bbm * BLOCK_SIZE) + block.thread_rank()] = T;
+                for (int ch = 0; ch < CHANNELS; ++ch) {
+                    sampled_ar[(bbm * BLOCK_SIZE * CHANNELS) + ch * BLOCK_SIZE + block.thread_rank()] = C[ch];
+                }
+                sampled_ard[(bbm * BLOCK_SIZE) + block.thread_rank()] = expected_invdepth;
+                ++bbm;
+            }
 
 			contributor++;  // 对渲染当前像素RGB值有贡献的高斯的个数
 
@@ -455,6 +504,14 @@ renderCUDA(
         for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 	}
+
+    // max reduce the last contributor
+    typedef cub::BlockReduce<uint32_t, BLOCK_SIZE> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+    last_contributor = BlockReduce(temp_storage).Reduce(last_contributor, cub::Max());
+	if (block.thread_rank() == 0) {
+		max_contrib[tile_id] = last_contributor;
+	}
 }
 
 //! 渲染
@@ -463,13 +520,16 @@ void FORWARD::render(
     dim3 block,         // 定义的线程块 block的维度，(16, 16, 1)
 	const uint2* ranges,        // 每个tile在 排序后的keys列表中的 起始和终止位置。索引：tile ID，值[x,y)：该tile在keys列表中起始、终止位置，个数y-x：落在该tile_ID上的高斯的个数。也可以用[x,y)在排序后的values列表中索引到该tile触及的所有高斯ID
 	const uint32_t* point_list, // 按 tile ID、高斯深度 排序后的 values列表，即 高斯ID 列表
-	int W, int H,
+    const uint32_t* per_tile_bucket_offset, uint32_t* bucket_to_tile,
+    float* sampled_T, float* sampled_ar, float* sampled_ard,
+    int W, int H,
 	const float2* means2D,  // 已计算的 所有高斯 中心在当前相机图像平面的二维坐标
 	const float* colors,    // 所有高斯 在当前相机中心的观测方向下 的RGB颜色值 数组
 	const float4* conic_opacity,    // 已计算的 所有高斯 2D协方差矩阵的逆 和 不透明度
 	float* final_T,         // 输出的 渲染后每个像素 pixel的 累积的透射率 的数组
 	uint32_t* n_contrib,    // 输出的 渲染每个像素 pixel穿过的高斯的个数，也是最后一个对渲染该像素RGB值 有贡献的高斯ID 的数组
-	const float* bg_color,  // 背景颜色，默认为[0,0,0]，黑色
+    uint32_t* max_contrib,
+    const float* bg_color,  // 背景颜色，默认为[0,0,0]，黑色
 	float* out_color)       // 输出的 RGB图像（加上了背景颜色）
 {
     // 开始进入CUDA并行计算，将图像分为多个线程块（分配一个 进程）；每个线程块为每个像素分配一个线程；
@@ -479,12 +539,15 @@ void FORWARD::render(
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
 		point_list,
+		per_tile_bucket_offset, bucket_to_tile,
+		sampled_T, sampled_ar, sampled_ard,
 		W, H,
 		means2D,
 		colors,
 		conic_opacity,
 		final_T,
 		n_contrib,
+		max_contrib,
 		bg_color,
 		out_color);
 }
@@ -499,13 +562,14 @@ void FORWARD::render(
 void FORWARD::preprocess(
     int P,      // 所有高斯的个数
     int D,      // 当前的球谐阶数
-    int M,      // 每个高斯的球谐系数个数=16
+    int M,      // 每个高斯的球谐系数个数=16 / 15
 	const float* means3D,   // 所有高斯 中心的世界坐标 数组，(x0, y0, z0, ..., xn, yn, zn)
 	const glm::vec3* scales,    // 所有高斯的 缩放因子
 	const float scale_modifier, // 缩放因子的调整系数
 	const glm::vec4* rotations, // 所有高斯的 旋转四元数
 	const float* opacities,     // 所有高斯的 不透明度
-	const float* shs,           // 所有高斯的 球谐系数
+    const float* dc,            // 空tensor            或 所有高斯的 球谐系数直流分量，(N,1,3)
+    const float* shs,           // 所有高斯的 全部球谐系数 或 剩余分量，(N,16,3) or (N,15,3)
 	bool* clamped,              // 输出的 所有高斯 是否被裁剪的标志 数组，某位置为 True表示：该高斯在当前相机的观测角度下，其RGB值3个的某个值 < 0，在后续渲染中不考虑它
 	const float* cov3D_precomp, // 因预计算的3D协方差矩阵默认是空tensor，则传入的是一个 NULL指针
 	const float* colors_precomp,    // 因预计算的颜色默认是空tensor，则传入的是一个 NULL指针
@@ -523,7 +587,8 @@ void FORWARD::preprocess(
 	float4* conic_opacity,  // 输出的 所有高斯 2D协方差的逆 和 不透明度 数组
 	const dim3 grid,        // CUDA网格的维度，grid.x是网格在x方向上的线程块数，grid.y是网格在y方向上的线程块数
 	uint32_t* tiles_touched,    // 输出的 所有高斯 在当前相机图像平面覆盖的线程块 tile的个数 数组
-	bool prefiltered)       // 预滤除的标志，默认为False
+	bool prefiltered,       // 预滤除的标志，默认为False
+    bool antialiasing)      // 是否 抗锯齿
 {
     /**
      * 核函数使用__global__修饰符声明。这表明该函数是一个核函数（只能在 GPU上执行，不能在 CPU上执行）
@@ -543,6 +608,7 @@ void FORWARD::preprocess(
 		scale_modifier,
 		rotations,
 		opacities,
+		dc,
 		shs,
 		clamped,
 		cov3D_precomp,
@@ -561,6 +627,7 @@ void FORWARD::preprocess(
 		conic_opacity,
 		grid,
 		tiles_touched,
-		prefiltered
+		prefiltered,
+		antialiasing
 		);
 }
